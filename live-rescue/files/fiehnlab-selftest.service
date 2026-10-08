@@ -1,5 +1,5 @@
 [Unit]
-Description=fiehnlab-live boot selftest, mirrored to the serial console
+Description=rescue-os boot selftest, mirrored to the serial console
 # Headless/remote-debug convenience: a rescue stick is often plugged into a
 # box with no monitor, or verified over QEMU's serial console (see the
 # build's own QEMU verification notes) - this makes the full

@@ -1,5 +1,5 @@
 [Unit]
-Description=fiehnlab-live local chat LLM (llama.cpp, qwen3-local by default)
+Description=rescue-os local chat LLM (llama.cpp, qwen3-local by default)
 After=network.target
 ConditionPathExists=/opt/models
 

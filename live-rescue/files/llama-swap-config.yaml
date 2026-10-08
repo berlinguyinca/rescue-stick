@@ -1,4 +1,4 @@
-# llama-swap config for fiehnlab-live's ON-DEMAND model tier - decoupled
+# llama-swap config for rescue-os's ON-DEMAND model tier - decoupled
 # from the two fixed always-on units (llama-chat.service :8080,
 # llama-embed.service :8081). Models are added here at runtime by
 # fiehnlab-models (or by hand) after an `hf download`; llama-swap

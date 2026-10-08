@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# fzf-based curated model picker for fiehnlab-live's on-demand llama-swap
+# fzf-based curated model picker for rescue-os's on-demand llama-swap
 # tier (:9090). Ships a reliable baseline regardless of whether a
 # maintained standalone GGUF TUI exists this year: curated presets with
 # known-good quants, free-text HF search, and a passthrough to

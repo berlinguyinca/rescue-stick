@@ -32,7 +32,7 @@ cd stick
 ./forge-stick.sh all /dev/sdX    # render logins + copy ISOs + write ventoy.json
 ```
 
-`fiehnlab-live` is a large custom build — build it with
+`rescue-os` is a large custom build — build it with
 [`../live-rescue/build-live.sh`](../live-rescue) and drop the resulting ISO into
 `~/fiehnlab-stick/isos/` before step 3.
 

@@ -1,4 +1,4 @@
-# fiehnlab-live
+# rescue-os
 
 A remastered Ubuntu 24.04 Desktop **LIVE** ISO (image #4 in this repo):
 boots from USB to RAM/GNOME, amnesic, and doubles as a portable
@@ -313,7 +313,7 @@ also goes away, the GitHub release asset pinned at
 |---|---|---|
 | Base ISO | 6.25 GB | 6.25 GB |
 | Modified `minimal.standard.live.squashfs` | ~3.87 GiB (4,151,361,536 bytes) | see build report (AI brains + qwen2.5-coder:7b + nomic-embed-text + RE toolset + Ghidra added; expected roughly double, ~9-10 GiB) |
-| Final ISO | ~8.55 GiB (9,179,627,520 bytes) `fiehnlab-live-v1.iso` | ~13-14 GiB expected `fiehnlab-live-v2.iso` |
+| Final ISO | ~8.55 GiB (9,179,627,520 bytes) `rescue-os-v1.iso` | ~13-14 GiB expected `rescue-os-v2.iso` |
 
 v1's single-file squashfs was only 143MB under the plain ISO9660 4 GiB−1
 per-file limit; v2's is expected well over 4 GiB. **Verified before trusting
@@ -329,7 +329,7 @@ the single most likely hard-blocker for v2 and it is **not** a blocker.
 sudo -n true   # must already work - the script needs passwordless sudo
 ./build-live.sh \
   --base-iso /path/to/ubuntu-24.04.5.1-desktop-amd64.iso \
-  --out /path/to/fiehnlab-live-v2.iso \
+  --out /path/to/rescue-os-v2.iso \
   --work /path/to/scratch-workdir   # NOT inside this repo; needs ~35-45GB free
 
 # Walking-skeleton proof only (installs htop, repacks, stops):
@@ -370,11 +370,11 @@ qemu-system-x86_64 \
   -machine q35,accel=kvm -cpu host -smp 8 -m 16G \
   -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
   -drive if=pflash,format=raw,file=OVMF_VARS.fd \
-  -drive if=none,id=iso,format=raw,readonly=on,file=fiehnlab-live-v2.iso \
+  -drive if=none,id=iso,format=raw,readonly=on,file=rescue-os-v2.iso \
   -device ide-cd,drive=iso,bootindex=0 \
   -nic user,model=virtio-net-pci -vga std -display none \
   -vnc 127.0.0.1:9 -monitor unix:/tmp/v2.sock,server,nowait \
-  -serial file:serial.log -name fiehnlab-live-v2
+  -serial file:serial.log -name rescue-os-v2
 ```
 
 v2 needs more RAM than v1's `8G` — CPU inference on the baked 7B model

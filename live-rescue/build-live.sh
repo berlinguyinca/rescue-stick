@@ -1,5 +1,5 @@
 #!/bin/bash
-# fiehnlab-live: remaster an Ubuntu 24.04 Desktop LIVE ISO into a portable
+# rescue-os: remaster an Ubuntu 24.04 Desktop LIVE ISO into a portable
 # workstation + rescue/diagnostic tool (boots from USB to GNOME, amnesic).
 #
 # Image #4 in this repo. See README.md in this directory for the full
@@ -37,7 +37,7 @@
 # Usage:
 #   sudo -n true   # this script needs passwordless sudo for mount/chroot/squashfs
 #   ./build-live.sh --base-iso /path/to/ubuntu-24.04.5.1-desktop-amd64.iso \
-#                    --out /path/to/fiehnlab-live-v1.iso \
+#                    --out /path/to/rescue-os-v1.iso \
 #                    --work /path/to/scratch-workdir \
 #                    [--phase0-only] [--bake-model qwen2.5-coder:7b] [--skip-rescue-tools]
 #
@@ -129,7 +129,7 @@ LOWER_MIN="$WORK/mnt/lower-minimal"
 LOWER_STD="$WORK/mnt/lower-standard"
 UPPER_IMG="$WORK/work.img"
 UPPER_MNT="$WORK/mnt/work-ext4"
-L=/var/log/fiehnlab-live-build.log   # inside the chroot
+L=/var/log/rescue-os-build.log   # inside the chroot
 
 mkdir -p "$WORK" "$M" "$LOWER_MIN" "$LOWER_STD" "$UPPER_MNT"
 cd "$WORK"
@@ -1065,13 +1065,13 @@ purge_any_gpu_driver() {
     fi
     dpkg -l | grep "^ii" | grep -iE "$GPUPAT" && { echo "GPU DRIVER STILL PRESENT - BUILD SHOULD FAIL" >&2; exit 1; } || echo "confirmed: no GPU driver baked" | tee -a "$L"
   '
-  [ $? -eq 0 ] || fatal "a GPU driver is still present after the purge attempt - this portable image must never ship one baked in. Check $WORK/logs/fiehnlab-live-build.log for what pulled it in and purge manually before re-running."
+  [ $? -eq 0 ] || fatal "a GPU driver is still present after the purge attempt - this portable image must never ship one baked in. Check $WORK/logs/rescue-os-build.log for what pulled it in and purge manually before re-running."
 }
 
 cleanup_chroot() {
   log "=== preserving build logs to \$WORK/logs before they get truncated/wiped ==="
   mkdir -p "$WORK/logs"
-  for f in "$M/var/log/fiehnlab-live-build.log" "$M/tmp/llama-embed-build.log" "$M/tmp/llama-chat-build.log" "$M/tmp/pi-smoke.log"; do
+  for f in "$M/var/log/rescue-os-build.log" "$M/tmp/llama-embed-build.log" "$M/tmp/llama-chat-build.log" "$M/tmp/pi-smoke.log"; do
     [ -f "$f" ] && sudo -n cp -a "$f" "$WORK/logs/$(basename "$f")" 2>/dev/null
   done
   log "=== final cleanup (apt/pip/npm caches, logs) before resquash ==="
@@ -1080,7 +1080,7 @@ cleanup_chroot() {
     rm -rf /root/.cache /root/.npm /tmp/* 2>/dev/null
     find /var/log -type f -exec truncate -s0 {} \; 2>/dev/null
   '
-  log "preserved logs (if present) under $WORK/logs/ - fiehnlab-live-build.log, llama-embed-build.log, llama-chat-build.log, pi-smoke.log"
+  log "preserved logs (if present) under $WORK/logs/ - rescue-os-build.log, llama-embed-build.log, llama-chat-build.log, pi-smoke.log"
 }
 
 # ============================================================================

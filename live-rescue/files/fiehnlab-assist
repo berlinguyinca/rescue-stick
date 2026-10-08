@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Zero-knowledge entry point for fiehnlab-live v2: a friendly greeting, then
+# Zero-knowledge entry point for rescue-os v2: a friendly greeting, then
 # pi in rescue-assist mode (PI_RESCUE_ASSIST=1) so freeform plain-language
 # input ("the wifi is slow", "is my network safe?") auto-routes to
 # pi-rescue's /assist concierge. See provision/live-rescue/README.md.
@@ -27,7 +27,7 @@ banner() {
   cat <<'EOF'
 
   ============================================================
-   fiehnlab-live :: Rescue Assistant
+   rescue-os :: Rescue Assistant
   ============================================================
 
   Hi -- tell me what's wrong, or ask a question. For example:

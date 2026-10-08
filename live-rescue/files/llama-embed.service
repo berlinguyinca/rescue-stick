@@ -1,5 +1,5 @@
 [Unit]
-Description=fiehnlab-live local embeddings model (llama.cpp, nomic-embed-text)
+Description=rescue-os local embeddings model (llama.cpp, nomic-embed-text)
 After=network.target
 ConditionPathExists=/opt/models
 

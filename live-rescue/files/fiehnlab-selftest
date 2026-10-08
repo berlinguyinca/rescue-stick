@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# QEMU/boot-verification helper for fiehnlab-live v3 (llama.cpp edition).
+# QEMU/boot-verification helper for rescue-os v3 (llama.cpp edition).
 # Prints OK/FAILED/NOTE per check (most are best-effort informational), but
 # a specific FATAL set makes this exit non-zero - the whole point of this
 # script is to fail LOUDLY on the things that matter, not report a clean
@@ -12,7 +12,7 @@ bad(){ printf '[selftest] FAILED: %s\n' "$*"; }
 fatal(){ printf '[selftest] FATAL: %s\n' "$*"; FATAL_FAILS=$((FATAL_FAILS+1)); }
 note(){ printf '[selftest] NOTE: %s\n' "$*"; }
 
-echo "===== fiehnlab-live v3 selftest ====="
+echo "===== rescue-os v3 selftest ====="
 
 command -v pi >/dev/null 2>&1 && ok "pi --version -> $(pi --version 2>&1)" || fatal "pi not found"
 
