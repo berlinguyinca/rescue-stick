@@ -65,8 +65,8 @@ LLAMACPP_TAG_FALLBACK="b11490"
 LLAMA_SWAP_TAG_FALLBACK="v262"
 QWEN3_HF_REPO="Qwen/Qwen3-8B-GGUF"           # ungated, apache-2.0, text-only instruct
 QWEN3_HF_FILE="Qwen3-8B-Q4_K_M.gguf"
-GEMMA_HF_REPO="ggml-org/gemma-3-1b-it-GGUF"  # ungated re-upload (google/gemma-3-1b-it is gated)
-GEMMA_HF_FILE="gemma-3-1b-it-Q4_K_M.gguf"
+LOWRAM_HF_REPO="Qwen/Qwen3-1.7B-GGUF"   # small + real tool-calling (gemma dropped: no reliable tool calling)
+LOWRAM_HF_FILE="Qwen3-1.7B-Q4_K_M.gguf"
 NOMIC_HF_REPO="nomic-ai/nomic-embed-text-v1.5-GGUF"
 NOMIC_HF_FILE="nomic-embed-text-v1.5.Q8_0.gguf"
 LLM_GATEWAY_URL="${LLM_GATEWAY_URL:-https://llm.example.com/v1}"   # online LLM gateway baked into models.json; set to your real gateway for your own build
@@ -851,7 +851,7 @@ payload_llamacpp() {
       && log "OK: fiehnlab-selftest.service enabled (serial-console boot report)" || log "FAILED: systemctl enable fiehnlab-selftest"
   '
 
-  log "=== downloading baked GGUF models via hf: qwen3-8b (chat), gemma-3-1b (low-RAM fallback), nomic-embed-text (embeddings) ==="
+  log "=== downloading baked GGUF models via hf: qwen3-8b (chat), qwen3-1.7b (low-RAM fallback), nomic-embed-text (embeddings) ==="
   chroot_run '
     set -uo pipefail; L='"$L"'; log(){ echo "[$(date -Is)] $*" | tee -a "$L"; }
     command -v hf >/dev/null 2>&1 || { log "FAILED: hf CLI missing - payload_hf_cli must run before payload_llamacpp"; exit 0; }
@@ -860,23 +860,23 @@ payload_llamacpp() {
     [ -s /opt/models/'"$QWEN3_HF_FILE"' ] && log "cached: '"$QWEN3_HF_FILE"' already in /opt/models" || \
       { hf download '"$QWEN3_HF_REPO"' '"$QWEN3_HF_FILE"' --local-dir /opt/models >>"$L" 2>&1 \
         && log "OK: baked '"$QWEN3_HF_FILE"' (default chat model)" || log "FAILED: hf download '"$QWEN3_HF_REPO"'"; }
-    [ -s /opt/models/'"$GEMMA_HF_FILE"' ] && log "cached: '"$GEMMA_HF_FILE"' already in /opt/models" || \
-      { hf download '"$GEMMA_HF_REPO"' '"$GEMMA_HF_FILE"' --local-dir /opt/models >>"$L" 2>&1 \
-        && log "OK: baked '"$GEMMA_HF_FILE"' (low-RAM fallback - edit /etc/default/llama-chat to switch)" || log "FAILED: hf download '"$GEMMA_HF_REPO"'"; }
+    [ -s /opt/models/'"$LOWRAM_HF_FILE"' ] && log "cached: '"$LOWRAM_HF_FILE"' already in /opt/models" || \
+      { hf download '"$LOWRAM_HF_REPO"' '"$LOWRAM_HF_FILE"' --local-dir /opt/models >>"$L" 2>&1 \
+        && log "OK: baked '"$LOWRAM_HF_FILE"' (low-RAM fallback - edit /etc/default/llama-chat to switch)" || log "FAILED: hf download '"$LOWRAM_HF_REPO"'"; }
     [ -s /opt/models/'"$NOMIC_HF_FILE"' ] && log "cached: '"$NOMIC_HF_FILE"' already in /opt/models" || \
       { hf download '"$NOMIC_HF_REPO"' '"$NOMIC_HF_FILE"' --local-dir /opt/models >>"$L" 2>&1 \
         && log "OK: baked '"$NOMIC_HF_FILE"' (embeddings)" || log "FAILED: hf download '"$NOMIC_HF_REPO"'"; }
     chmod -R a+rX /opt/models
   '
   require_in_upper "opt/models/$QWEN3_HF_FILE" "qwen3-8b GGUF download"
-  require_in_upper "opt/models/$GEMMA_HF_FILE" "gemma-3-1b GGUF download"
+  require_in_upper "opt/models/$LOWRAM_HF_FILE" "qwen3-1.7b GGUF download"
   require_in_upper "opt/models/$NOMIC_HF_FILE" "nomic-embed-text GGUF download"
 
   # Stable symlinks so the systemd units never hardcode an exact GGUF filename
   # (a case typo in llama-chat.default once pointed at a nonexistent path and
   # llama-chat never served). Relative targets resolve inside the booted image.
   sudo -n ln -sf "$QWEN3_HF_FILE" "$M/opt/models/chat-default.gguf"
-  sudo -n ln -sf "$GEMMA_HF_FILE" "$M/opt/models/chat-lowram.gguf"
+  sudo -n ln -sf "$LOWRAM_HF_FILE" "$M/opt/models/chat-lowram.gguf"
   sudo -n ln -sf "$NOMIC_HF_FILE" "$M/opt/models/embed-default.gguf"
   require_in_upper "opt/models/chat-default.gguf" "chat-default.gguf stable symlink"
   require_in_upper "opt/models/embed-default.gguf" "embed-default.gguf stable symlink"

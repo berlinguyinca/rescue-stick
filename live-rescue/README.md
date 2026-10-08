@@ -13,7 +13,7 @@ For the user-facing "what you actually get," see
 
 - **Local LLM stack (llama.cpp, no cloud needed):**
   - `llama-chat` on `:8080` — alias `qwen3-local`, serving **Qwen3-8B** (Q4_K_M),
-    with **gemma-3-1b** (Q4_K_M) baked as a low-RAM fallback.
+    with **Qwen3-1.7B** (Q4_K_M) baked as a low-RAM fallback (small, with tool-calling).
   - `llama-embed` on `:18081` — **nomic-embed-text v1.5** (Q8) for RAG.
   - `llama-swap` on `:9090` — on-demand models fetched later via `fiehnlab-models` / `hf`.
   - `fiehnlab-llama` picks the backend at boot: NVIDIA→CUDA, AMD/Intel→Vulkan,

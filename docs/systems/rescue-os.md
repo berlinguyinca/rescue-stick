@@ -70,7 +70,7 @@ key is reachable, otherwise the baked local model.
 |---|---|
 | **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (CUDA + Vulkan builds) | Runs the local models; auto-picks CUDA → real Vulkan GPU → CPU at every boot, whatever hardware it lands on |
 | **Qwen3-8B** (`qwen3-local`, :8080) | Default always-on chat model, 16k context |
-| **gemma-3-1b** | Low-RAM fallback — one edit to `/etc/default/llama-chat` to switch |
+| **Qwen3-1.7B** | Low-RAM fallback (small, tool-calling) — one edit to `/etc/default/llama-chat` to switch |
 | **nomic-embed-text** (:18081) | Always-on embeddings model, backs the RAG index |
 | **[llama-swap](https://github.com/mostlygeek/llama-swap)** (:9090) | On-demand tier for any extra model you pull mid-session |
 | **`fiehnlab-models`**, **`fiehnlab-pull-model`**, **`hf`** | Pick a curated model, search Hugging Face, or pull any GGUF by repo — registers it into llama-swap automatically |
