@@ -47,6 +47,7 @@ load_config(){
   [ -f "$f" ] && { set -a; . "$f"; set +a; }
   : "${PRIMARY_USER:=}"; : "${USER_PW_HASH:=}"; : "${SSH_AUTHORIZED_KEY:=}"
   : "${LLM_GATEWAY_URL:=https://llm.example.com/v1}"
+  : "${NODE_GATEWAYS:=https://llm.metabolomics.us}"   # comma-separated InferWeave gateways a gpu-node registers with
   # Fall back to the local ed25519 public key if no key was given explicitly.
   if [ -z "$SSH_AUTHORIZED_KEY" ] && [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
     SSH_AUTHORIZED_KEY="$(cat "$HOME/.ssh/id_ed25519.pub")"
@@ -60,7 +61,8 @@ load_config(){
     PRIMARY_USER=alice
     USER_PW_HASH=\$(openssl passwd -6)                        # login/sudo password hash
     SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'         # or ensure ~/.ssh/id_ed25519.pub exists
-    LLM_GATEWAY_URL=https://llm.example.com/v1                # optional (online gateway)"
+    LLM_GATEWAY_URL=https://llm.example.com/v1                # optional (online gateway)
+    NODE_GATEWAYS=https://llm.metabolomics.us                 # optional (gateways gpu-nodes register with, comma-separated)"
 }
 
 cmd_install_ventoy(){
@@ -108,13 +110,16 @@ cmd_render(){
     local seed="${SEEDS[$i]}" role="${ROLES[$i]}"
     [ "$seed" = "-" ] && continue
     [ -f "$PROVISION/$seed" ] || die "$role: template $PROVISION/$seed not found"
+    local agent_b64; agent_b64="$(base64 -w0 "$PROVISION/autoinstall/files/fiehnlab-register")"
     sed -e "s|@@PRIMARY_USER@@|$PRIMARY_USER|g" \
         -e "s|@@USER_PW_HASH@@|$USER_PW_HASH|g" \
         -e "s|@@LLM_GATEWAY_URL@@|$LLM_GATEWAY_URL|g" \
+        -e "s|@@NODE_GATEWAYS@@|$NODE_GATEWAYS|g" \
+        -e "s|@@REGISTER_AGENT_B64@@|$agent_b64|g" \
         -e "s|@@SSH_AUTHORIZED_KEY@@|$SSH_AUTHORIZED_KEY|g" \
         "$PROVISION/$seed" > "$SEEDDIR/${role}-user-data"
-    if grep -qE '@@[A-Z_]+@@' "$SEEDDIR/${role}-user-data"; then
-      die "$role: unresolved placeholder(s): $(grep -oE '@@[A-Z_]+@@' "$SEEDDIR/${role}-user-data" | sort -u | tr '\n' ' ')"
+    if grep -qE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data"; then
+      die "$role: unresolved placeholder(s): $(grep -oE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data" | sort -u | tr '\n' ' ')"
     fi
     log "rendered ${role}-user-data"
   done

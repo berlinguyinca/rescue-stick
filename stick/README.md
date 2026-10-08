@@ -26,6 +26,7 @@ cd stick
 #      USER_PW_HASH='...'        # single-quoted! make one with:  openssl passwd -6
 #      SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # or just have ~/.ssh/id_ed25519.pub
 #      LLM_GATEWAY_URL=https://llm.example.com/v1          # optional (online model gateway)
+#      NODE_GATEWAYS=https://llm.metabolomics.us           # optional (gateways a gpu-node registers with, comma-separated; this is the default)
 
 # 3) Fetch the ISOs, then write the stick.
 ./forge-stick.sh fetch           # downloads/copies the manifest's ISOs into ~/fiehnlab-stick/isos
