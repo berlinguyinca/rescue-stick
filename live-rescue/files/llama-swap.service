@@ -1,0 +1,13 @@
+[Unit]
+Description=fiehnlab-live on-demand model swap (llama-swap, :9090)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/llama-swap --config /etc/llama-swap/config.yaml --listen 127.0.0.1:9090
+Restart=on-failure
+RestartSec=3
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+# EnvironmentFile for llama-chat.service. Edit + `systemctl restart
+# llama-chat` to switch models without touching the unit file. The default
+# points at a STABLE SYMLINK (/opt/models/chat-default.gguf), created by
+# payload_llamacpp from $QWEN3_HF_FILE, so the exact GGUF filename/case/version
+# can change without breaking the unit. For a low-RAM / no-GPU box, switch to
+# the baked tiny gemma: LLAMA_CHAT_MODEL=/opt/models/chat-lowram.gguf
+LLAMA_CHAT_MODEL=/opt/models/chat-default.gguf
+LLAMA_CHAT_ALIAS=qwen3-local
+LLAMA_CHAT_CTX=16384

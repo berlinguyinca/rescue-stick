@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Fiehnlab Unlock Secrets
+Comment=Open the Ventoy LUKS secrets container and load API keys/gh auth/AWS creds into this session
+Exec=/usr/local/bin/fiehnlab-unlock
+Icon=dialog-password
+Terminal=true
+Categories=System;Security;

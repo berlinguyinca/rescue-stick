@@ -1,0 +1,9 @@
+# never commit built artifacts or secrets
+*.iso
+*.img
+*.squashfs
+*.luks
+fiehnlab-stick/
+stick-secrets.env
+**/work/
+**/out/

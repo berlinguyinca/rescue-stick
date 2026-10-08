@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Rescue Assistant
+Comment=Describe the problem in plain words - the AI assistant figures out what's wrong
+Exec=gnome-terminal -- /usr/local/bin/fiehnlab-assist
+Icon=utilities-terminal
+Terminal=false
+Categories=System;Utility;
+X-GNOME-Autostart-enabled=true
+NoDisplay=false

@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# Zero-knowledge entry point for fiehnlab-live v2: a friendly greeting, then
+# pi in rescue-assist mode (PI_RESCUE_ASSIST=1) so freeform plain-language
+# input ("the wifi is slow", "is my network safe?") auto-routes to
+# pi-rescue's /assist concierge. See provision/live-rescue/README.md.
+#
+# Picks a model with NO user input required:
+#   - if the metabolomics gateway key looks real AND the gateway answers,
+#     use pi's configured default (the gateway, fast + capable).
+#   - otherwise (offline, no key, or the gateway is unreachable) fall back
+#     to the baked local llama.cpp chat model via --model, and make sure
+#     llama-chat.service is actually up first (starting it if this is the
+#     first time this boot).
+#
+# Safe to run more than once; closing the terminal just ends this session -
+# the rest of the live desktop keeps working normally (this never blocks
+# GNOME or any other app).
+set -uo pipefail
+
+MODELS_JSON="$HOME/.pi/agent/models.json"
+LOCAL_MODEL="${FIEHNLAB_LOCAL_MODEL:-qwen3-local}"
+GATEWAY_URL="@@LLM_GATEWAY_URL@@/models"
+
+say(){ printf '%s\n' "$*"; }
+
+banner() {
+  cat <<'EOF'
+
+  ============================================================
+   fiehnlab-live :: Rescue Assistant
+  ============================================================
+
+  Hi -- tell me what's wrong, or ask a question. For example:
+
+    "the wifi is slow"
+    "this PC won't start"
+    "is my network safe?"
+    "show me what this app is sending"
+
+  Type your question below and press Enter. (Ctrl+C or close this
+  window any time -- the rest of the desktop keeps working.)
+
+EOF
+}
+
+ensure_local_llm_up() {
+  curl -fsS --max-time 1 http://127.0.0.1:8080/health >/dev/null 2>&1 && return 0
+  systemctl is-active --quiet llama-chat 2>/dev/null && return 0
+  say "[fiehnlab-assist] starting the local model runtime (first use this boot) ..."
+  sudo systemctl start llama-chat 2>/dev/null || true
+  for _ in $(seq 1 60); do
+    curl -fsS --max-time 1 http://127.0.0.1:8080/health >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+gateway_key_looks_real() {
+  [ -f "$MODELS_JSON" ] || return 1
+  command -v jq >/dev/null 2>&1 || return 1
+  local key
+  key=$(jq -r '.providers.metabolomics.apiKey // ""' "$MODELS_JSON" 2>/dev/null)
+  [ -n "$key" ] && [ "$key" != "REPLACE_WITH_YOUR_KEY" ]
+}
+
+gateway_reachable() {
+  curl -fsS --max-time 3 "$GATEWAY_URL" -o /dev/null 2>/dev/null
+}
+
+banner
+
+MODEL_ARGS=()
+if gateway_key_looks_real && gateway_reachable; then
+  say "[fiehnlab-assist] using the metabolomics gateway (online)."
+else
+  say "[fiehnlab-assist] gateway unavailable or no key yet -- using the local model."
+  if ensure_local_llm_up; then
+    MODEL_ARGS=(--model "local/${LOCAL_MODEL}")
+  else
+    say "[fiehnlab-assist] WARNING: could not start the local model runtime either."
+    say "[fiehnlab-assist] pi will still start; ask it to retry once the network or llama-chat is up."
+  fi
+fi
+
+export PI_RESCUE_ASSIST=1
+export PI_OPENVIKING_ENABLED="${PI_OPENVIKING_ENABLED:-0}"
+
+exec pi "${MODEL_ARGS[@]}"

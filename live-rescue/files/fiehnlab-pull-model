@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# v3: llama.cpp/hf replacement for the old `ollama pull`. Downloads one GGUF
+# file from a Hugging Face repo and registers it into llama-swap (:9090,
+# on-demand tier - the two always-on services at :8080/:8081 are baked at
+# build time and untouched by this). For a curated, browsable experience
+# use fiehnlab-models instead; this is the quick one-liner path.
+#
+# Usage: fiehnlab-pull-model <hf-repo> [filename-or-quant] [alias]
+#   fiehnlab-pull-model Qwen/Qwen3-8B-GGUF Qwen3-8B-Q5_K_M.gguf qwen3-8b-q5
+#   fiehnlab-pull-model unsloth/Qwen3.5-4B-GGUF Q4_K_M            # matches *Q4_K_M.gguf
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=fiehnlab-llama-common.sh
+source /usr/local/lib/fiehnlab-llama-common.sh 2>/dev/null || source "$HERE/fiehnlab-llama-common.sh"
+
+REPO="${1:-}"
+WANT="${2:-}"
+ALIAS="${3:-}"
+[ -n "$REPO" ] || { echo "usage: fiehnlab-pull-model <hf-repo> [filename-or-quant] [alias]" >&2; exit 1; }
+command -v hf >/dev/null 2>&1 || { echo "ERROR: 'hf' not found on PATH" >&2; exit 1; }
+
+DIR="$(fiehnlab_pick_model_dir)"
+export HF_HOME="${HF_HOME:-$DIR/.hf-cache}"
+mkdir -p "$DIR" "$HF_HOME"
+
+echo "[fiehnlab-pull-model] listing files in $REPO ..."
+FILES=$(hf models info "$REPO" 2>/dev/null \
+  | python3 -c 'import json,sys; [print(s["rfilename"]) for s in json.load(sys.stdin).get("siblings",[]) if s["rfilename"].endswith(".gguf")]' 2>/dev/null)
+if [ -z "$FILES" ]; then
+  # Fall back to the public HF API directly (works even without `hf`, or
+  # against an older hf version with a different models/info shape).
+  FILES=$(curl -fsS "https://huggingface.co/api/models/$REPO" 2>/dev/null \
+    | python3 -c 'import json,sys; [print(s["rfilename"]) for s in json.load(sys.stdin).get("siblings",[]) if s["rfilename"].endswith(".gguf")]' 2>/dev/null)
+fi
+[ -n "$FILES" ] || { echo "ERROR: could not list .gguf files in $REPO (repo missing, gated, or network down)" >&2; exit 1; }
+
+if [ -n "$WANT" ]; then
+  FILE=$(echo "$FILES" | grep -i -- "$WANT" | head -1)
+else
+  # Prefer a Q4_K_M-ish middle-ground quant if no preference was given.
+  FILE=$(echo "$FILES" | grep -iE 'Q4_K_M' | head -1)
+  [ -n "$FILE" ] || FILE=$(echo "$FILES" | head -1)
+fi
+[ -n "$FILE" ] || { echo "ERROR: no .gguf file in $REPO matched '$WANT'. Available:" >&2; echo "$FILES" >&2; exit 1; }
+
+echo "[fiehnlab-pull-model] downloading $REPO/$FILE -> $DIR (this downloads several GB over the network) ..."
+hf download "$REPO" "$FILE" --local-dir "$DIR" || { echo "ERROR: hf download failed" >&2; exit 1; }
+GGUF_PATH="$DIR/$FILE"
+[ -s "$GGUF_PATH" ] || { echo "ERROR: $GGUF_PATH missing/empty after download" >&2; exit 1; }
+
+NAME="${ALIAS:-$(basename "$FILE" .gguf | tr 'A-Z' 'a-z')}"
+EMBED_FLAG=()
+echo "$FILE" | grep -qi embed && EMBED_FLAG=(--embeddings)
+
+python3 /usr/local/lib/fiehnlab-llama-swap-register.py "$NAME" "$GGUF_PATH" "${EMBED_FLAG[@]}" \
+  && echo "[fiehnlab-pull-model] done. llama-swap (http://127.0.0.1:9090/v1) will serve it as '$NAME' within a few seconds (config auto-reload)." \
+  || echo "WARNING: downloaded OK but could not register with llama-swap - add it to /etc/llama-swap/config.yaml by hand." >&2

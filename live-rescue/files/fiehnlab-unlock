@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+# Finds fiehnlab-secrets.luks on an exFAT volume (the Ventoy stick), opens
+# it, and loads keys into THIS live session only (RAM/tmpfs - never written
+# back to the squashfs media). Re-run any time; safe to run twice.
+set -uo pipefail
+MAPNAME=fiehnlab-secrets
+MNT=/run/fiehnlab-secrets
+say(){ printf '[fiehnlab-unlock] %s\n' "$*"; }
+die(){ say "ERROR: $*"; exit 1; }
+
+if [ "$(id -u)" -ne 0 ]; then
+  exec sudo -E "$0" "$@"
+fi
+
+say "scanning block devices for an exFAT volume carrying fiehnlab-secrets.luks ..."
+LUKS_PATH=""
+STICK_MNT=""
+for dev in $(lsblk -lnpo NAME,FSTYPE | awk '$2=="exfat"{print $1}'); do
+  tmp_mnt=$(mktemp -d /run/fiehnlab-scan.XXXXXX)
+  already=$(findmnt -n -o TARGET "$dev" 2>/dev/null | head -1)
+  if [ -n "$already" ]; then
+    cand="$already"
+  else
+    mount -o ro "$dev" "$tmp_mnt" 2>/dev/null || { rmdir "$tmp_mnt"; continue; }
+    cand="$tmp_mnt"
+  fi
+  if [ -f "$cand/fiehnlab-secrets.luks" ]; then
+    LUKS_PATH="$cand/fiehnlab-secrets.luks"
+    STICK_MNT="$cand"
+    say "found: $LUKS_PATH"
+    break
+  fi
+  if [ "$cand" = "$tmp_mnt" ]; then umount "$tmp_mnt" 2>/dev/null; rmdir "$tmp_mnt" 2>/dev/null; fi
+done
+[ -n "$LUKS_PATH" ] || die "no fiehnlab-secrets.luks found on any mounted/mountable exFAT volume. Insert the Ventoy stick and retry."
+
+if [ ! -e "/dev/mapper/$MAPNAME" ]; then
+  say "opening LUKS container (passphrase prompt) ..."
+  cryptsetup luksOpen "$LUKS_PATH" "$MAPNAME" || die "luksOpen failed/cancelled"
+fi
+mkdir -p "$MNT"
+mountpoint -q "$MNT" || mount -o ro "/dev/mapper/$MAPNAME" "$MNT" || die "mount of mapped volume failed"
+say "secrets container mounted read-only at $MNT"
+
+REAL_USER="${SUDO_USER:-$(logname 2>/dev/null || echo ubuntu)}"
+REAL_HOME=$(getent passwd "$REAL_USER" | cut -d: -f6)
+[ -d "$REAL_HOME" ] || REAL_HOME=/home/ubuntu
+
+if [ -f "$MNT/secrets.env" ]; then
+  set -a; . "$MNT/secrets.env"; set +a
+  say "sourced secrets.env (METABOLOMICS_API_KEY/GH_TOKEN exported into this shell)"
+  printf 'export METABOLOMICS_API_KEY=%q\nexport GH_TOKEN=%q\n' "${METABOLOMICS_API_KEY:-}" "${GH_TOKEN:-}" \
+    > "$REAL_HOME/.fiehnlab-session-env"
+  chown "$REAL_USER":"$REAL_USER" "$REAL_HOME/.fiehnlab-session-env" 2>/dev/null
+  chmod 0600 "$REAL_HOME/.fiehnlab-session-env"
+  grep -q fiehnlab-session-env "$REAL_HOME/.bashrc" 2>/dev/null || \
+    echo '[ -f "$HOME/.fiehnlab-session-env" ] && . "$HOME/.fiehnlab-session-env"' >> "$REAL_HOME/.bashrc"
+fi
+
+if [ -f "$MNT/gh-token" ]; then
+  sudo -u "$REAL_USER" env HOME="$REAL_HOME" bash -c 'gh auth login --with-token' < "$MNT/gh-token" \
+    && say "OK: gh auth login" || say "WARN: gh auth login failed"
+  if [ -d /opt/pi-engineering-runtime ]; then
+    say "pi-engineering already baked at /opt/pi-engineering-runtime (v2 image) - not cloning again into ~/IdeaProjects"
+  elif [ -d "$REAL_HOME/IdeaProjects" ] && [ ! -d "$REAL_HOME/IdeaProjects/pi-engineering-runtime" ]; then
+    sudo -u "$REAL_USER" env HOME="$REAL_HOME" gh repo clone berlinguyinca/pi-engineering "$REAL_HOME/IdeaProjects/pi-engineering-runtime" \
+      && say "OK: pi-engineering cloned" || say "NOTE: pi-engineering clone failed (check gh auth / network)"
+  fi
+fi
+
+if [ -d "$MNT/aws" ]; then
+  sudo -u "$REAL_USER" mkdir -p "$REAL_HOME/.aws"
+  sudo -u "$REAL_USER" cp -a "$MNT/aws/." "$REAL_HOME/.aws/"
+  chmod 700 "$REAL_HOME/.aws"; chmod 600 "$REAL_HOME/.aws"/* 2>/dev/null
+  say "OK: aws/ -> ~/.aws/"
+fi
+
+if [ -f "$MNT/llm-api-key" ]; then
+  KEY=$(tr -d '\n' < "$MNT/llm-api-key")
+  for f in "$REAL_HOME/.pi/agent/models.json"; do
+    [ -f "$f" ] || continue
+    sudo -u "$REAL_USER" jq --arg k "$KEY" '.providers.metabolomics.apiKey=$k' "$f" > "${f}.tmp" \
+      && sudo -u "$REAL_USER" mv "${f}.tmp" "$f" && say "OK: wrote llm-api-key into $f"
+  done
+  # herdr: no documented config schema baked in (see README); drop the raw key
+  # for manual wiring if/when herdr needs it.
+  install -d -m700 -o "$REAL_USER" -g "$REAL_USER" "$REAL_HOME/.herdr" 2>/dev/null
+  printf '%s' "$KEY" | sudo -u "$REAL_USER" tee "$REAL_HOME/.herdr/llm-api-key" >/dev/null 2>&1
+fi
+
+if [ -d "$MNT/ssh" ]; then
+  # SSH identities live ONLY in the LUKS container, never in the image. Install
+  # them into the live session's ~/.ssh (tmpfs / RAM - amnesic, gone on reboot).
+  sudo -u "$REAL_USER" install -d -m700 "$REAL_HOME/.ssh"
+  for f in "$MNT/ssh"/*; do
+    [ -e "$f" ] || continue
+    sudo -u "$REAL_USER" cp -f "$f" "$REAL_HOME/.ssh/$(basename "$f")"
+  done
+  chown -R "$REAL_USER":"$REAL_USER" "$REAL_HOME/.ssh"
+  chmod 700 "$REAL_HOME/.ssh"
+  # Private keys 0600; public keys / known_hosts / config relaxed.
+  find "$REAL_HOME/.ssh" -maxdepth 1 -type f ! -name '*.pub' ! -name 'known_hosts' ! -name 'config' -exec chmod 600 {} +
+  chmod 644 "$REAL_HOME/.ssh"/*.pub 2>/dev/null || true
+  chmod 600 "$REAL_HOME/.ssh/config" "$REAL_HOME/.ssh/known_hosts" 2>/dev/null || true
+  say "OK: ssh/ -> ~/.ssh/ (private keys 0600, RAM-only) - ssh/scp now authenticate as you"
+  # Best-effort: also load into a running desktop ssh-agent (helps passphrased keys).
+  for k in "$REAL_HOME/.ssh"/id_*; do
+    case "$k" in *.pub) continue;; esac
+    [ -f "$k" ] || continue
+    sudo -u "$REAL_USER" env HOME="$REAL_HOME" ssh-add "$k" >/dev/null 2>&1 \
+      && say "OK: ssh-add $(basename "$k")" || true
+  done
+fi
+
+if [ -f "$MNT/tailscale/authkey" ] && command -v tailscale >/dev/null 2>&1; then
+  TS_KEY=$(tr -d '\n' < "$MNT/tailscale/authkey")
+  tailscale up --authkey="$TS_KEY" --hostname="fiehnlab-rescue-$(hostname -s 2>/dev/null || echo live)" >/dev/null 2>&1 \
+    && say "OK: tailscale up (joined tailnet)" \
+    || say "NOTE: tailscale up failed (no network / key expired?) - key is in the container; run 'sudo tailscale up' manually"
+  unset TS_KEY
+fi
+
+if [ -d "$MNT/fiehnlab-creds" ]; then
+  # Lab credential bundle (BMC/iLO, MikroTik, cluster recovery keys, ...). Lands
+  # in ~/.config/fiehnlab (RAM, 0600) for you and the pi-rescue skills to read.
+  sudo -u "$REAL_USER" install -d -m700 "$REAL_HOME/.config/fiehnlab"
+  sudo -u "$REAL_USER" cp -a "$MNT/fiehnlab-creds/." "$REAL_HOME/.config/fiehnlab/"
+  chown -R "$REAL_USER":"$REAL_USER" "$REAL_HOME/.config/fiehnlab"
+  chmod 700 "$REAL_HOME/.config/fiehnlab"
+  find "$REAL_HOME/.config/fiehnlab" -type f -exec chmod 600 {} +
+  say "OK: lab creds (bmc/mikrotik/recovery) -> ~/.config/fiehnlab/"
+  # A single sourceable env file (export BMC_*/MIKROTIK_* ...) is auto-loaded in shells.
+  if [ -f "$REAL_HOME/.config/fiehnlab/env" ]; then
+    grep -q 'config/fiehnlab/env' "$REAL_HOME/.bashrc" 2>/dev/null || \
+      echo '[ -f "$HOME/.config/fiehnlab/env" ] && . "$HOME/.config/fiehnlab/env"' >> "$REAL_HOME/.bashrc"
+  fi
+fi
+
+if [ -f "$MNT/pgpass" ]; then
+  sudo -u "$REAL_USER" cp -f "$MNT/pgpass" "$REAL_HOME/.pgpass"
+  chown "$REAL_USER":"$REAL_USER" "$REAL_HOME/.pgpass"; chmod 600 "$REAL_HOME/.pgpass"
+  say "OK: pgpass -> ~/.pgpass (psql will auto-auth)"
+fi
+
+umount "$MNT" 2>/dev/null
+say "done. Secrets container left open at /dev/mapper/$MAPNAME (unmounted). Run 'cryptsetup luksClose $MAPNAME' when finished, or just reboot/power off (amnesic)."

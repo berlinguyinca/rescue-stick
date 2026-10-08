@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Installs the LATEST GPU driver for THIS boot's hardware, on demand.
+# A live image can't ship a driver matched to unknown target hardware, and
+# the live kernel can't persist a DKMS build across reboots anyway - this
+# is meant to be re-run each session after fiehnlab-unlock/network is up.
+set -uo pipefail
+[ "$(id -u)" -eq 0 ] || exec sudo -E "$0" "$@"
+V=$(lspci -nn | grep -iE 'VGA|3D|Display')
+echo "$V"
+if echo "$V" | grep -qi nvidia; then
+  echo "[fiehnlab-gpu] NVIDIA detected; installing latest cuda-drivers against $(uname -r)"
+  apt-get update
+  apt-get install -y "linux-headers-$(uname -r)" cuda-drivers nvidia-container-toolkit
+  nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
+  echo "[fiehnlab-gpu] done. You may need to modprobe nvidia or reboot this session."
+elif echo "$V" | grep -qiE '\[1002:'; then
+  echo "[fiehnlab-gpu] AMD detected; fetching latest amdgpu-install for this release"
+  REL=$(. /etc/os-release; echo "$VERSION_CODENAME")
+  AI=$(curl -fsSL "https://repo.radeon.com/amdgpu-install/latest/ubuntu/$REL/" | grep -oE "amdgpu-install_[^\" ]+_all\.deb" | head -1)
+  [ -n "$AI" ] || { echo "[fiehnlab-gpu] could not find an amdgpu-install package for $REL" >&2; exit 1; }
+  curl -fsSL -o /tmp/amdgpu-install.deb "https://repo.radeon.com/amdgpu-install/latest/ubuntu/$REL/$AI"
+  apt-get install -y /tmp/amdgpu-install.deb
+  amdgpu-install -y --usecase=rocm --no-dkms
+  getent group render >/dev/null || groupadd render
+  getent group video >/dev/null || groupadd video
+  usermod -aG render,video "${SUDO_USER:-ubuntu}"
+  echo "[fiehnlab-gpu] done (no-dkms: driver is good for THIS boot only; re-run next session)."
+else
+  echo "[fiehnlab-gpu] no discrete NVIDIA/AMD GPU detected via lspci."
+fi

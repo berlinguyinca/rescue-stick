@@ -1,0 +1,503 @@
+#cloud-config
+# =============================================================================
+# Fiehnlab GPU-node unattended Ubuntu Server install   (role label: gpu-node)
+# -----------------------------------------------------------------------------
+# TEMPLATE. Build step must substitute @@USER_PW_HASH@@ with the real
+# sha512crypt hash (kept OUT of git per the "no passwords in GitHub" rule) to
+# produce the deployable user-data. See provision/autoinstall/README.md.
+#
+# Subiquity / cloud-init autoinstall, schema version 1. Target: Ubuntu Server
+# 24.04 LTS (noble) live-server (also valid on 26.04 LTS).
+#
+# WHOLE-DISK WIPE: this erases the selected internal disk with no confirmation.
+# Disk selection (early-commands + match) deliberately EXCLUDES USB/removable
+# media so it can never wipe the Ventoy boot stick. There is no MAC guard (this
+# image is meant for a fresh/blank GPU box, not a specific node) — only boot
+# this menu entry on a machine whose internal disk you intend to erase.
+# =============================================================================
+autoinstall:
+  version: 1
+
+  # Do not let the installer self-update mid-run (avoids a network-dependent hang)
+  refresh-installer:
+    update: false
+
+  # Minimal server footprint; let the installer search for NVIDIA drivers
+  source:
+    id: ubuntu-server-minimal
+    search_drivers: true
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  # ---- Network: DHCP on any wired interface -------------------------------
+  network:
+    version: 2
+    ethernets:
+      all-en:
+        match: {name: "en*"}
+        dhcp4: true
+        dhcp6: false
+        optional: true
+      all-eth:
+        match: {name: "eth*"}
+        dhcp4: true
+        dhcp6: false
+        optional: true
+
+  # ---- Disk selection ------------------------------------------------------
+  # In-file default: largest SSD/NVMe. Per subiquity docs the `ssd` and `size`
+  # selectors NEVER return the install-media disk, so the Ventoy stick is
+  # already excluded. early-commands below then OVERRIDES this with an explicit
+  # non-USB, non-removable target (NVMe preferred) and aborts if none exists —
+  # defense-in-depth against a USB stick that reports as non-rotational.
+  storage:
+    layout:
+      name: direct
+      match:
+        ssd: true
+
+  # ---- Pick the install disk AND a random unused Futurama hostname --------
+  # Runs in the live installer (python3 + python3-yaml present). DHCP is already
+  # up here, so DNS lookups work. Writes both the chosen /dev/path (storage) and
+  # a hostname that does NOT already resolve into /autoinstall.yaml; subiquity
+  # re-reads the file after early-commands. Aborts (non-zero) if no eligible
+  # non-USB fixed disk exists, rather than silently falling through.
+  early-commands:
+    - |
+      python3 - <<'PY'
+      import subprocess, sys, yaml, random
+
+      # --- choose a random Futurama character not already in DNS -------------
+      # fry / admin-workstation / zoidberg are already taken, so they're excluded from the pool.
+      POOL = ['leela','farnsworth','amy','hermes','zapp','kif','nibbler','scruffy',
+              'calculon','morbo','flexo','roberto','clamps','mom','nixon','cubert',
+              'lrrr','hypnotoad','donbot','wernstrom','hedonismbot']
+      def taken(name):
+          for host in (name + '.fiehnlab.ucdavis.edu', name):
+              try:
+                  r = subprocess.run(['getent','hosts',host], capture_output=True, timeout=5)
+                  if r.returncode == 0 and r.stdout.strip():
+                      return True
+              except Exception:
+                  pass   # resolver error/timeout -> treat as "unknown", keep trying others
+          return False
+      pool = POOL[:]; random.shuffle(pool)
+      hostname = next((n for n in pool if not taken(n)), None)
+      if hostname is None:   # pool exhausted or no DNS: random name + 2-hex suffix
+          hostname = random.choice(POOL) + '-' + ''.join(random.choice('0123456789abcdef') for _ in range(2))
+
+      # --- choose the install disk: hardware-blind. Parse lsblk JSON (blank fields
+      # never collapse, unlike positional output -> RAID/odd-controller disks that
+      # report an empty TRAN are NOT wrongly skipped). Exclude only USB/removable
+      # boot media; rank the remaining INTERNAL disks NVMe > SSD > HDD, largest first.
+      import json
+      def truthy(v): return str(v).strip().lower() in ('1', 'true', 'yes')
+      bd = json.loads(subprocess.check_output(
+          ['lsblk', '-J', '-b', '-o', 'NAME,PATH,TYPE,TRAN,ROTA,RM,SIZE']).decode())
+      cands = []
+      for d in bd.get('blockdevices', []):
+          if d.get('type') != 'disk':
+              continue
+          tran = (d.get('tran') or '').lower()
+          if tran == 'usb' or truthy(d.get('rm')):
+              continue   # the Ventoy stick / any removable media
+          name = d.get('name', ''); path = d.get('path') or ('/dev/' + name)
+          size = int(d.get('size') or 0)
+          is_nvme = (tran == 'nvme') or name.startswith('nvme')
+          is_ssd  = not truthy(d.get('rota'))              # rota true == rotational == HDD
+          tier = 0 if is_nvme else (1 if is_ssd else 2)    # NVMe > SSD > HDD
+          cands.append((tier, -size, path))
+      if not cands:
+          sys.stderr.write('autoinstall: no eligible internal disk (all USB/removable); aborting\n')
+          sys.exit(1)
+      cands.sort()
+      target = cands[0][2]
+
+      # Clear stale holders/signatures so subiquity's 'direct' layout can repartition a
+      # disk that still carries an old OS/array/LVM (the box is being reinstalled, so the
+      # target is meant to be wiped). Without this, curtin crashes on a busy/signed disk
+      # ("an error occurred, press enter to start a shell"). All best-effort.
+      for c in (['swapoff', '-a'],
+                ['bash', '-c', 'vgchange -an || true'],
+                ['bash', '-c', 'mdadm --stop --scan || true'],
+                ['wipefs', '-a', target],
+                ['bash', '-c', 'sgdisk --zap-all ' + target + ' || true']):
+          try:
+              subprocess.run(c, capture_output=True, timeout=60)
+          except Exception:
+              pass
+
+      # --- write both back into the autoinstall config -----------------------
+      p = '/autoinstall.yaml'
+      doc = yaml.safe_load(open(p))
+      root = doc['autoinstall'] if isinstance(doc, dict) and 'autoinstall' in doc else doc
+      root['storage'] = {'layout': {'name': 'direct', 'match': {'path': target}}}
+      root.setdefault('identity', {})['hostname'] = hostname
+      yaml.safe_dump(doc, open(p, 'w'), default_flow_style=False)
+      sys.stderr.write('autoinstall: hostname = %s ; install target = %s\n' % (hostname, target))
+      PY
+
+  # ---- Proprietary GPU drivers (NVIDIA handled here automatically) --------
+  # NVIDIA driver is installed FIRST BOOT from the NVIDIA CUDA repo (latest
+  # cuda-drivers, incl. open modules for recent GPUs) against the running kernel,
+  # NOT subiquity's recommended driver — avoids a dual-source conflict and
+  # guarantees "latest". AMD: latest ROCm via amdgpu-install. See the GPU
+  # late-command (adds the repo) + the first-boot GPU setup script (installs it).
+  drivers:
+    install: false
+
+  # ---- SSH: key-only (password SSH stays off — the account password is for
+  #      console/sudo only). Established admin-workstation admin key. --------------------
+  ssh:
+    install-server: true
+    allow-pw: false          # password SSH off at install (drop-in below adds the rest)
+    authorized-keys:
+      - "@@SSH_AUTHORIZED_KEY@@"
+
+  # ---- Admin user (auto-added to the sudo group => full sudo) --------------
+  # hostname here is only a FALLBACK — early-commands above overwrites it with a
+  # random Futurama name that doesn't already resolve in DNS. (If early-commands
+  # somehow didn't run, this static value is what you'd get.)
+  identity:
+    hostname: gpunode
+    username: "@@PRIMARY_USER@@"
+    password: "@@USER_PW_HASH@@"
+
+  # ---- Packages from the archive ------------------------------------------
+  packages:
+    # security hardening (configured on first boot by fiehnlab-harden.sh)
+    - ufw
+    - unattended-upgrades
+    - auditd
+    - apparmor-utils
+    - docker.io
+    - docker-compose-v2
+    - software-properties-common
+    - ca-certificates
+    - curl
+    - gnupg
+    - pciutils
+    - htop
+    - vim
+    - prometheus-node-exporter   # host metrics on :9100 for the lab Prometheus/Grafana
+
+  updates: security
+
+  # ---- On-failure visibility -----------------------------------------------
+  # If the install fails, subiquity normally shows only a generic "an error
+  # occurred, press enter to start a shell" page. These run in the live installer
+  # after a failure: they (1) copy the real logs onto the Ventoy stick's data
+  # partition (label "Ventoy") so they can be read later on admin-workstation, and (2) print
+  # the actual error lines to tty1 so a phone photo of the screen shows the cause.
+  error-commands:
+    - |
+      set +e
+      LOG=/var/log/installer
+      OUT=/run/fiehnlab-install-fail
+      mkdir -p "$OUT"
+      cp -a "$LOG" "$OUT/installer-logs" 2>/dev/null
+      journalctl -b --no-pager > "$OUT/journal.txt" 2>/dev/null
+      lsblk -J -o NAME,PATH,SIZE,TYPE,TRAN,ROTA,RM,FSTYPE,MOUNTPOINT > "$OUT/lsblk.json" 2>/dev/null
+      cp /autoinstall.yaml "$OUT/autoinstall.yaml" 2>/dev/null
+      ip -o addr > "$OUT/ipaddr.txt" 2>/dev/null
+      # Persist onto the Ventoy data partition (read it on admin-workstation afterwards)
+      for p in $(blkid -o device 2>/dev/null); do
+        if [ "$(blkid -s LABEL -o value "$p" 2>/dev/null)" = "Ventoy" ]; then
+          mkdir -p /run/vtoy && mount "$p" /run/vtoy 2>/dev/null \
+            && rm -rf /run/vtoy/FIEHNLAB-INSTALL-FAIL \
+            && cp -a "$OUT" /run/vtoy/FIEHNLAB-INSTALL-FAIL 2>/dev/null \
+            && sync && umount /run/vtoy 2>/dev/null && break
+        fi
+      done
+      # Show the real error on screen for a phone photo
+      {
+        echo "===================================================="
+        echo " FIEHNLAB INSTALL FAILED - real error below"
+        echo " Full logs saved to the Ventoy stick: FIEHNLAB-INSTALL-FAIL/"
+        echo "===================================================="
+        grep -iE 'error|fail|traceback|exception|cannot|no space|not found|timed out|no route|temporary failure' -A1 "$LOG"/*.log 2>/dev/null | tail -n 45
+        echo "---- network ----"; ip -o -4 addr show scope global 2>/dev/null || echo "(no global IPv4 - DHCP/network may have failed)"
+        echo "---- disks ----"; lsblk -o NAME,SIZE,TYPE,TRAN,FSTYPE 2>/dev/null
+        echo "===================================================="
+      } > /dev/tty1 2>&1
+
+  # ---- Post-install, in the installed system (/target). Each step logs
+  #      success/FAILED to /var/log/fiehnlab-provision.log (no silent `|| true`).
+  # Each command is a YAML literal block scalar (- |-) so shell colons/quotes are
+  # taken literally. Each logs OK/FAILED to /var/log/fiehnlab-provision.log in the
+  # installed system (no silent `|| true`).
+  late-commands:
+    # Role label
+    - |-
+      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/fiehnlab && echo gpu-node > /etc/fiehnlab/role'
+    # Admin group memberships (docker.io creates the docker group)
+    - |-
+      curtin in-target --target=/target -- bash -c 'L=/var/log/fiehnlab-provision.log; { getent group docker >/dev/null || groupadd docker; usermod -aG docker @@PRIMARY_USER@@; echo "OK: docker group"; } >>$L 2>&1 || echo "FAILED: docker group" >>$L'
+    # Docker on at boot
+    - |-
+      curtin in-target --target=/target -- bash -c 'L=/var/log/fiehnlab-provision.log; systemctl enable docker.service containerd.service >>$L 2>&1 && echo "OK: docker enabled" >>$L || echo "FAILED: docker enable" >>$L'
+    # Apptainer: official PPA, fallback to latest GitHub .deb (asset is apptainer_<ver>_amd64.deb, skip -suid)
+    - |-
+      curtin in-target --target=/target -- bash -c 'L=/var/log/fiehnlab-provision.log; { add-apt-repository -y ppa:apptainer/ppa && apt-get update && apt-get install -y apptainer; } >>$L 2>&1 || { U=$(curl -fsSL https://api.github.com/repos/apptainer/apptainer/releases/latest | grep -oE "https://[^\" ]+_amd64\.deb" | grep -v suid | head -1); curl -fsSL -o /tmp/apptainer.deb "$U" && apt-get install -y /tmp/apptainer.deb; } >>$L 2>&1; command -v apptainer >>$L 2>&1 && echo "OK: apptainer $(apptainer --version 2>/dev/null)" >>$L || echo "FAILED: apptainer" >>$L'
+    # GPU stack by vendor. NVIDIA: base driver from drivers.install; add nvidia-container-toolkit
+    # for `docker --gpus` and wire it into docker. AMD: ROCm via amdgpu-install (the real compute driver).
+    - |-
+      curtin in-target --target=/target -- bash -c 'L=/var/log/fiehnlab-provision.log; V=$(lspci -nn | grep -iE "VGA|3D|Display"); echo "$V" > /etc/fiehnlab/gpu; if echo "$V" | grep -qi nvidia; then { install -d -m0755 /usr/share/keyrings; D=$(. /etc/os-release; echo ${VERSION_ID//./}); curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu${D}/x86_64/cuda-keyring_1.1-1_all.deb -o /tmp/cuda-keyring.deb && dpkg -i /tmp/cuda-keyring.deb; curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed "s#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g" > /etc/apt/sources.list.d/nvidia-container-toolkit.list && apt-get update && apt-get install -y nvidia-container-toolkit && nvidia-ctk runtime configure --runtime=docker; echo "OK: nvidia-container-toolkit"; } >>$L 2>&1 || echo "FAILED: nvidia-container-toolkit" >>$L; elif echo "$V" | grep -qiE "\[1002:"; then { REL=$(. /etc/os-release; echo $VERSION_CODENAME); AI=$(curl -fsSL "https://repo.radeon.com/amdgpu-install/latest/ubuntu/$REL/" | grep -oE "amdgpu-install_[^\" ]+_all\.deb" | head -1); curl -fsSL -o /tmp/amdgpu-install.deb "https://repo.radeon.com/amdgpu-install/latest/ubuntu/$REL/$AI" && apt-get install -y /tmp/amdgpu-install.deb && amdgpu-install -y --usecase=rocm --no-dkms; getent group render >/dev/null || groupadd render; getent group video >/dev/null || groupadd video; usermod -aG render,video @@PRIMARY_USER@@; echo "OK: rocm + render,video"; } >>$L 2>&1 || echo "FAILED: rocm (install ROCm manually)" >>$L; else echo "NOTE: no discrete GPU detected" >>$L; fi'
+
+  # ---- First-boot GPU-in-containers finalizer -----------------------------
+  # Container GPU access that needs the LIVE GPU (NVIDIA CDI generation, docker
+  # runtime wiring verified against a real device) can't happen during the
+  # install (no GPU in the installer; it's a chroot). cloud-init writes a oneshot
+  # that runs on the real hardware on first boot(s): it waits for the driver, then
+  #   NVIDIA -> `nvidia-ctk cdi generate` (+/etc/cdi/nvidia.yaml) and ensures the
+  #             docker nvidia runtime  => `docker run --gpus all` and CDI both work;
+  #             Apptainer uses `--nv` with the host driver (no extra setup).
+  #   AMD    -> generate AMD CDI if amd-ctk is present; otherwise log the device
+  #             passthrough recipe. `apptainer run --rocm` uses the host ROCm.
+  # Re-runs each boot until it succeeds (marker: /etc/fiehnlab/.gpu-container-done).
+  user-data:
+    write_files:
+      # ===== Security hardening (pragmatic). Config files written here; applied on
+      # first boot by fiehnlab-harden.sh (see runcmd). ufw runs on the real kernel. =====
+      - path: /etc/ssh/sshd_config.d/10-fiehnlab-hardening.conf
+        permissions: "0644"
+        content: |
+          # Key-only SSH. Named 10- so it is read before 50-cloud-init.conf (sshd
+          # takes the first value seen). Password auth is also disabled at install
+          # via autoinstall ssh.allow-pw:false. MaxAuthTries kept at the default 6
+          # so an agent offering several keys before the right one is not locked out.
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          ChallengeResponseAuthentication no
+          PubkeyAuthentication yes
+          PermitRootLogin no
+          PermitEmptyPasswords no
+          AllowUsers @@PRIMARY_USER@@
+          X11Forwarding no
+          ClientAliveInterval 300
+          ClientAliveCountMax 2
+          LoginGraceTime 30
+      - path: /etc/sysctl.d/99-fiehnlab-hardening.conf
+        permissions: "0644"
+        content: |
+          # Network + kernel hardening. rp_filter=2 (loose), NOT 1 (strict): strict
+          # breaks docker's many interfaces / multi-homed hosts. Deliberately NOT set
+          # (docker/apptainer need them): ip_forward, unprivileged_userns_clone,
+          # bridge-nf-*, unprivileged_bpf_disabled.
+          net.ipv4.conf.all.rp_filter = 2
+          net.ipv4.conf.default.rp_filter = 2
+          net.ipv4.conf.all.accept_redirects = 0
+          net.ipv4.conf.default.accept_redirects = 0
+          net.ipv4.conf.all.secure_redirects = 0
+          net.ipv4.conf.default.secure_redirects = 0
+          net.ipv4.conf.all.send_redirects = 0
+          net.ipv4.conf.default.send_redirects = 0
+          net.ipv4.conf.all.accept_source_route = 0
+          net.ipv4.conf.default.accept_source_route = 0
+          net.ipv6.conf.all.accept_redirects = 0
+          net.ipv6.conf.default.accept_redirects = 0
+          net.ipv6.conf.all.accept_source_route = 0
+          net.ipv6.conf.default.accept_source_route = 0
+          net.ipv4.tcp_syncookies = 1
+          net.ipv4.icmp_echo_ignore_broadcasts = 1
+          net.ipv4.icmp_ignore_bogus_error_responses = 1
+          net.ipv4.conf.all.log_martians = 1
+          net.ipv4.conf.default.log_martians = 1
+          kernel.kptr_restrict = 2
+          kernel.dmesg_restrict = 1
+          kernel.yama.ptrace_scope = 1
+          kernel.perf_event_paranoid = 3
+          net.core.bpf_jit_harden = 2
+          fs.protected_hardlinks = 1
+          fs.protected_symlinks = 1
+          fs.protected_fifos = 2
+          fs.protected_regular = 2
+          fs.suid_dumpable = 0
+      - path: /etc/apt/apt.conf.d/20auto-upgrades
+        permissions: "0644"
+        content: |
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::AutocleanInterval "7";
+      - path: /etc/apt/apt.conf.d/52fiehnlab-unattended
+        permissions: "0644"
+        content: |
+          // Security-only auto-updates, NO auto-reboot. GPU driver + container
+          // packages are blacklisted so an unattended upgrade cannot cause a
+          // driver/library version mismatch or restart dockerd (killing running
+          // jobs) on a box that never auto-reboots.
+          Unattended-Upgrade::Allowed-Origins {
+              "${distro_id}:${distro_codename}-security";
+              "${distro_id}ESMApps:${distro_codename}-apps-security";
+              "${distro_id}ESM:${distro_codename}-infra-security";
+          };
+          Unattended-Upgrade::Package-Blacklist {
+              "nvidia-driver-";
+              "nvidia-dkms-";
+              "nvidia-kernel-";
+              "libnvidia-";
+              "nvidia-container";
+              "docker.io";
+              "docker-ce";
+              "containerd";
+          };
+          Unattended-Upgrade::Automatic-Reboot "false";
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+      - path: /etc/audit/rules.d/fiehnlab.rules
+        permissions: "0640"
+        content: |
+          # Lightweight forensic baseline: identity files, sudo scope, sshd config,
+          # and privileged (uid!=euid -> euid 0) execs.
+          -w /etc/passwd -p wa -k identity
+          -w /etc/shadow -p wa -k identity
+          -w /etc/group -p wa -k identity
+          -w /etc/gshadow -p wa -k identity
+          -w /etc/sudoers -p wa -k scope
+          -w /etc/sudoers.d/ -p wa -k scope
+          -w /etc/ssh/sshd_config -p wa -k sshd
+          -w /etc/ssh/sshd_config.d/ -p wa -k sshd
+          -a always,exit -F arch=b64 -S execve -C uid!=euid -F euid=0 -k privileged
+      - path: /etc/fiehnlab/ufw-docker-after.rules
+        permissions: "0644"
+        content: |
+          # BEGIN UFW AND DOCKER
+          *filter
+          :ufw-user-forward - [0:0]
+          :ufw-docker-logging-deny - [0:0]
+          :DOCKER-USER - [0:0]
+          -A DOCKER-USER -j ufw-user-forward
+          -A DOCKER-USER -j RETURN -s 10.0.0.0/8
+          -A DOCKER-USER -j RETURN -s 172.16.0.0/12
+          -A DOCKER-USER -j RETURN -s 192.168.0.0/16
+          -A DOCKER-USER -p udp -m udp --sport 53 --dport 1024:65535 -j RETURN
+          -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 192.168.0.0/16
+          -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 10.0.0.0/8
+          -A DOCKER-USER -j ufw-docker-logging-deny -p tcp -m tcp --tcp-flags FIN,SYN,RST,ACK SYN -d 172.16.0.0/12
+          -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 192.168.0.0/16
+          -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 10.0.0.0/8
+          -A DOCKER-USER -j ufw-docker-logging-deny -p udp -m udp --dport 0:32767 -d 172.16.0.0/12
+          -A DOCKER-USER -j RETURN
+          -A ufw-docker-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW DOCKER BLOCK] "
+          -A ufw-docker-logging-deny -j DROP
+          COMMIT
+          # END UFW AND DOCKER
+      - path: /usr/local/sbin/fiehnlab-harden.sh
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          # First-boot hardening finalizer (idempotent). Applies the config files
+          # written alongside it, plus the imperative bits that need the real kernel
+          # (ufw) or runtime state (root lock, service disables). role-aware via
+          # /etc/fiehnlab/role. Logs OK/FAILED to the provision log.
+          set +e
+          L=/var/log/fiehnlab-provision.log
+          ROLE=$(cat /etc/fiehnlab/role 2>/dev/null)
+          echo "=== fiehnlab-harden $(date -Is) role=$ROLE ===" >> "$L"
+          sysctl --system >>"$L" 2>&1 && echo "OK: sysctl" >>"$L" || echo "FAILED: sysctl" >>"$L"
+          systemctl reload ssh >>"$L" 2>&1 || systemctl reload sshd >>"$L" 2>&1; echo "OK: sshd reloaded" >>"$L"
+          passwd -l root >>"$L" 2>&1 && echo "OK: root locked" >>"$L" || echo "FAILED: root lock" >>"$L"
+          if command -v ufw >/dev/null; then
+            ufw --force reset >>"$L" 2>&1
+            ufw default deny incoming >>"$L" 2>&1
+            ufw default allow outgoing >>"$L" 2>&1
+            ufw allow 22/tcp >>"$L" 2>&1
+            for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
+              ufw allow from "$net" to any port 9100 proto tcp >>"$L" 2>&1
+              ufw allow from "$net" to any port 9835 proto tcp >>"$L" 2>&1
+            done
+            if ! grep -q 'BEGIN UFW AND DOCKER' /etc/ufw/after.rules 2>/dev/null; then
+              printf '\n' >> /etc/ufw/after.rules
+              cat /etc/fiehnlab/ufw-docker-after.rules >> /etc/ufw/after.rules
+            fi
+            ufw --force enable >>"$L" 2>&1 && echo "OK: ufw enabled" >>"$L" || echo "FAILED: ufw" >>"$L"
+          fi
+          systemctl enable --now auditd >>"$L" 2>&1 && augenrules --load >>"$L" 2>&1 && echo "OK: auditd" >>"$L" || echo "WARN: auditd" >>"$L"
+          systemctl enable --now apparmor >>"$L" 2>&1 && echo "OK: apparmor" >>"$L" || echo "WARN: apparmor" >>"$L"
+          systemctl enable --now unattended-upgrades >>"$L" 2>&1
+          systemctl enable apt-daily.timer apt-daily-upgrade.timer >>"$L" 2>&1 && echo "OK: unattended-upgrades" >>"$L" || echo "WARN: uu-timers" >>"$L"
+          if [ "$ROLE" = "gpu-node" ]; then
+            SVCS="avahi-daemon cups cups-browsed bluetooth ModemManager whoopsie"
+          else
+            SVCS="whoopsie apport"
+          fi
+          for s in $SVCS; do systemctl disable --now "$s" >>"$L" 2>&1; done
+          apt-get -y purge whoopsie >>"$L" 2>&1
+          echo "OK: hardening complete (role=$ROLE)" >>"$L"
+      - path: /usr/local/sbin/fiehnlab-gpu-container-setup.sh
+        permissions: "0755"
+        content: |
+          #!/usr/bin/env bash
+          L=/var/log/fiehnlab-provision.log
+          M=/etc/fiehnlab/.gpu-container-done
+          [ -f "$M" ] && exit 0
+          mkdir -p /etc/fiehnlab /etc/cdi
+          V=$(cat /etc/fiehnlab/gpu 2>/dev/null)
+          if echo "$V" | grep -qi nvidia; then
+            # Install the LATEST NVIDIA driver (CUDA repo) against the RUNNING kernel —
+            # DKMS builds correctly here, not in the install chroot. Single source for
+            # the driver; retries next boot on failure.
+            if ! nvidia-smi >/dev/null 2>&1; then
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update >>"$L" 2>&1
+              apt-get install -y "linux-headers-$(uname -r)" cuda-drivers >>"$L" 2>&1 \
+                && echo "OK: cuda-drivers (latest NVIDIA) installed" >>"$L" \
+                || echo "FAILED: cuda-drivers install (will retry next boot)" >>"$L"
+              modprobe nvidia >>"$L" 2>&1 || true
+            fi
+            for i in $(seq 1 36); do nvidia-smi >/dev/null 2>&1 && break; sleep 5; done
+            if command -v nvidia-ctk >/dev/null && nvidia-smi >/dev/null 2>&1; then
+              nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >>"$L" 2>&1 && echo "OK: nvidia CDI generated" >>"$L"
+              nvidia-ctk runtime configure --runtime=docker >>"$L" 2>&1 && systemctl restart docker >>"$L" 2>&1 && echo "OK: docker nvidia runtime (docker --gpus all ready)" >>"$L"
+              # nvidia_gpu_exporter (utkuozdemir) for the lab's nvidia-gpu Grafana dashboards, :9835
+              if [ ! -x /usr/local/bin/nvidia_gpu_exporter ]; then
+                U=$(curl -fsSL https://api.github.com/repos/utkuozdemir/nvidia_gpu_exporter/releases/latest | grep -oE "https://[^\" ]+_linux_x86_64\.tar\.gz" | head -1)
+                curl -fsSL "$U" | tar -xz -C /usr/local/bin nvidia_gpu_exporter >>"$L" 2>&1 && chmod 0755 /usr/local/bin/nvidia_gpu_exporter
+              fi
+              systemctl daemon-reload; systemctl enable --now nvidia_gpu_exporter.service >>"$L" 2>&1 && echo "OK: nvidia_gpu_exporter :9835" >>"$L" || echo "FAILED: nvidia_gpu_exporter" >>"$L"
+              touch "$M"
+            else
+              echo "WAIT: nvidia driver not ready; retry next boot" >>"$L"; exit 0
+            fi
+          elif echo "$V" | grep -qiE "\[1002:"; then
+            if command -v amd-ctk >/dev/null 2>&1; then
+              amd-ctk cdi generate --output=/etc/cdi/amd.yaml >>"$L" 2>&1 && echo "OK: amd CDI generated" >>"$L"
+            else
+              echo "NOTE: AMD containers -> docker run --device=/dev/kfd --device=/dev/dri --group-add video,render ; apptainer run --rocm" >>"$L"
+            fi
+            touch "$M"
+          else
+            echo "NOTE: no discrete GPU; skipping container-GPU setup" >>"$L"; touch "$M"
+          fi
+      - path: /etc/systemd/system/fiehnlab-gpu-container.service
+        content: |
+          [Unit]
+          Description=Fiehnlab GPU container enablement (CDI + docker runtime)
+          After=multi-user.target docker.service
+          Wants=docker.service
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/sbin/fiehnlab-gpu-container-setup.sh
+          [Install]
+          WantedBy=multi-user.target
+      - path: /etc/systemd/system/nvidia_gpu_exporter.service
+        content: |
+          [Unit]
+          Description=NVIDIA GPU Prometheus exporter (utkuozdemir)
+          After=network-online.target
+          [Service]
+          ExecStart=/usr/local/bin/nvidia_gpu_exporter
+          Restart=on-failure
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+    runcmd:
+      - [ bash, /usr/local/sbin/fiehnlab-harden.sh ]
+      - [ systemctl, enable, fiehnlab-gpu-container.service ]
+
+  # Reboot into the installed system when done
+  shutdown: reboot

@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# QEMU/boot-verification helper for fiehnlab-live v3 (llama.cpp edition).
+# Prints OK/FAILED/NOTE per check (most are best-effort informational), but
+# a specific FATAL set makes this exit non-zero - the whole point of this
+# script is to fail LOUDLY on the things that matter, not report a clean
+# "selftest passed" over a broken image. Safe to run as the live user;
+# sudo'd where needed.
+set -uo pipefail
+FATAL_FAILS=0
+ok(){ printf '[selftest] OK: %s\n' "$*"; }
+bad(){ printf '[selftest] FAILED: %s\n' "$*"; }
+fatal(){ printf '[selftest] FATAL: %s\n' "$*"; FATAL_FAILS=$((FATAL_FAILS+1)); }
+note(){ printf '[selftest] NOTE: %s\n' "$*"; }
+
+echo "===== fiehnlab-live v3 selftest ====="
+
+command -v pi >/dev/null 2>&1 && ok "pi --version -> $(pi --version 2>&1)" || fatal "pi not found"
+
+for cmd in diagnose network-triage assist; do
+  grep -q "\"$cmd\"\|'$cmd'\|$cmd:" /opt/pi-rescue-runtime/.pi/rescue.yaml 2>/dev/null \
+    && ok "pi-rescue skill registered in rescue.yaml: $cmd" \
+    || bad "pi-rescue skill missing from rescue.yaml: $cmd"
+done
+[ -d /opt/pi-rescue-runtime/node_modules ] && ok "pi-rescue node_modules installed" || fatal "pi-rescue node_modules missing"
+[ -d /opt/pi-engineering-runtime/node_modules ] && ok "pi-engineering node_modules installed" || fatal "pi-engineering node_modules missing"
+[ -f /opt/pi-rescue-runtime/kb/.vectors/index.json ] && ok "pi-rescue RAG index baked ($(wc -c < /opt/pi-rescue-runtime/kb/.vectors/index.json) bytes)" || bad "pi-rescue RAG index missing"
+
+# --- llama.cpp backends -----------------------------------------------
+for d in cuda vulkan; do
+  [ -x "/opt/llama.cpp/$d/llama-server" ] && ok "llama.cpp $d build installed" || fatal "llama.cpp $d build missing"
+done
+[ -x /usr/local/bin/fiehnlab-llama ] && ok "fiehnlab-llama GPU-detect wrapper installed" || fatal "fiehnlab-llama wrapper missing"
+
+# --- chat service (:8080) ----------------------------------------------
+sudo systemctl start llama-chat >/dev/null 2>&1 || true
+for i in $(seq 1 60); do curl -fsS --max-time 1 http://127.0.0.1:8080/health >/dev/null 2>&1 && break; sleep 2; done
+if curl -fsS http://127.0.0.1:8080/v1/models 2>/dev/null | grep -q qwen3-local; then
+  ok "qwen3-local present on llama-chat (:8080)"
+else
+  bad "qwen3-local not listed on :8080/v1/models"
+fi
+CHAT_JSON=$(curl -fsS --max-time 420 http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"qwen3-local","messages":[{"role":"user","content":"say hi in exactly three words"}],"max_tokens":64}' 2>/dev/null)
+ANSWER=$(echo "$CHAT_JSON" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(d["choices"][0]["message"].get("content") or "")
+except Exception:
+    print("")' 2>/dev/null)
+if [ -n "$ANSWER" ]; then
+  ok "chat completion on :8080 answered: $(echo "$ANSWER" | tr -d '\n' | head -c 200)"
+else
+  fatal "chat completion on :8080 returned no content (raw: $(echo "$CHAT_JSON" | head -c 300 | tr -d '\n'))"
+fi
+
+# --- embeddings service (:18081) ----------------------------------------
+sudo systemctl start llama-embed >/dev/null 2>&1 || true
+for i in $(seq 1 60); do curl -fsS --max-time 1 http://127.0.0.1:18081/health >/dev/null 2>&1 && break; sleep 2; done
+EMB_JSON=$(curl -fsS --max-time 60 http://127.0.0.1:18081/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{"model":"nomic-embed-text","input":"selftest probe"}' 2>/dev/null)
+DIM=$(echo "$EMB_JSON" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(len(d["data"][0]["embedding"]))
+except Exception:
+    print(0)' 2>/dev/null)
+if [ "${DIM:-0}" = "768" ]; then
+  ok "embeddings on :18081 returned a 768-dim vector"
+else
+  fatal "embeddings on :18081 did not return a 768-dim vector (got dim=${DIM:-0})"
+fi
+
+# --- RAG index embedder id ----------------------------------------------
+EMBEDDER=$(node -e 'try{console.log(JSON.parse(require("fs").readFileSync("/opt/pi-rescue-runtime/kb/.vectors/index.json","utf8")).embedderId||"")}catch(e){console.log("")}' 2>/dev/null)
+if [ "$EMBEDDER" = "openai:nomic-embed-text" ]; then
+  ok "baked RAG index embedderId == openai:nomic-embed-text"
+else
+  fatal "baked RAG index embedderId is '${EMBEDDER:-<unreadable>}', expected openai:nomic-embed-text"
+fi
+
+# --- pi smoke test (local provider, end to end) -------------------------
+TMPHOME=$(mktemp -d)
+cp -a "$HOME/.pi" "$TMPHOME/" 2>/dev/null
+if HOME="$TMPHOME" PI_OPENVIKING_ENABLED=0 PI_RESCUE_ASSIST=1 \
+   timeout 300 pi --model "local/qwen3-local" \
+   --print "say hi in exactly three words" >/tmp/pi-smoke.log 2>&1; then
+  ok "pi smoke test (extensions loaded, local provider answered) - $(tail -c 300 /tmp/pi-smoke.log | tr -d '\n')"
+else
+  fatal "pi smoke test failed - see /tmp/pi-smoke.log: $(tail -c 500 /tmp/pi-smoke.log | tr -d '\n')"
+fi
+rm -rf "$TMPHOME"
+
+# --- hf CLI + model picker TUI + llama-swap -----------------------------
+command -v hf >/dev/null 2>&1 && ok "hf CLI on PATH ($(hf --version 2>&1 | head -1))" || fatal "hf CLI missing from PATH"
+[ -x /usr/local/bin/fiehnlab-models ] && ok "fiehnlab-models present" || fatal "fiehnlab-models missing"
+command -v llama-swap >/dev/null 2>&1 && ok "llama-swap binary present" || bad "llama-swap binary missing"
+systemctl is-enabled --quiet llama-swap 2>/dev/null && ok "llama-swap.service enabled" || note "llama-swap.service not enabled (check unit)"
+
+# --- previously-missing RE tools ----------------------------------------
+for t in mitmdump mitmweb mitmproxy ssh-mitm frida jadx testssl.sh tcptraceroute; do
+  command -v "$t" >/dev/null 2>&1 && ok "RE tool present: $t" || fatal "RE tool missing from PATH: $t"
+done
+[ -x /opt/ghidra/ghidraRun ] && command -v ghidraRun >/dev/null 2>&1 && ok "ghidraRun present (/opt/ghidra)" || fatal "ghidraRun missing"
+for t in bettercap sslsplit masscan netdiscover sslscan ntopng; do
+  command -v "$t" >/dev/null 2>&1 && ok "tool present: $t" || note "tool missing: $t"
+done
+
+# --- no leftover Ollama / GPU driver -------------------------------------
+[ ! -e /usr/local/bin/ollama ] && [ ! -d /usr/share/ollama ] && ok "no Ollama leftover (binary + state dir both absent)" || fatal "Ollama leftover present (/usr/local/bin/ollama or /usr/share/ollama)"
+dpkg -l 2>/dev/null | grep "^ii" | grep -iE 'cuda-drivers|nvidia-driver|nvidia-dkms|nvidia-kernel' \
+  && fatal "GPU driver package baked (should be empty)" || ok "no baked GPU driver (dpkg -l ^ii empty, as designed)"
+
+[ -x /usr/local/bin/fiehnlab-assist ] && ok "fiehnlab-assist installed" || bad "fiehnlab-assist missing"
+[ -f /etc/skel/.config/autostart/fiehnlab-assist.desktop ] && ok "assist autostart entry baked into /etc/skel" || bad "assist autostart entry missing"
+[ -f "$HOME/.config/autostart/fiehnlab-assist.desktop" ] && ok "assist autostart entry present in this session's home" || note "autostart entry not in current \$HOME (expected only after a fresh casper user creation)"
+
+echo "===== end selftest: $FATAL_FAILS fatal failure(s) ====="
+[ "$FATAL_FAILS" -eq 0 ] || exit 1

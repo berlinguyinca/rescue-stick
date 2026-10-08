@@ -1,0 +1,16 @@
+[Unit]
+Description=fiehnlab-live local embeddings model (llama.cpp, nomic-embed-text)
+After=network.target
+ConditionPathExists=/opt/models
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/fiehnlab-llama llama-server --host 127.0.0.1 --port 18081 --embeddings --alias nomic-embed-text -c 2048 -b 2048 -ub 2048 -m /opt/models/embed-default.gguf
+Restart=on-failure
+RestartSec=3
+User=nobody
+Group=nogroup
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

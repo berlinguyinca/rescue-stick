@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# fzf-based curated model picker for fiehnlab-live's on-demand llama-swap
+# tier (:9090). Ships a reliable baseline regardless of whether a
+# maintained standalone GGUF TUI exists this year: curated presets with
+# known-good quants, free-text HF search, and a passthrough to
+# llama.cpp's own `-hf repo:QUANT` one-shot pull-and-run.
+#
+# The two ALWAYS-ON services (qwen3-local chat :8080, nomic-embed-text
+# :8081) are baked at build time and are not managed here.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source /usr/local/lib/fiehnlab-llama-common.sh 2>/dev/null || source "$HERE/fiehnlab-llama-common.sh"
+
+command -v fzf >/dev/null 2>&1 || { echo "ERROR: fzf not found" >&2; exit 1; }
+command -v hf >/dev/null 2>&1 || { echo "ERROR: hf not found (pipx install missing?)" >&2; exit 1; }
+
+# name | hf repo | quant/filename hint | kind (chat|embed)
+CURATED=$(cat <<'EOF'
+qwen3-8b        | Qwen/Qwen3-8B-GGUF                     | Q4_K_M | chat
+qwen3-8b-q5     | Qwen/Qwen3-8B-GGUF                     | Q5_K_M | chat
+gemma-3-1b      | ggml-org/gemma-3-1b-it-GGUF            | Q4_K_M | chat
+qwen3-coder-30b | unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF | Q4_K_M | chat
+nomic-embed     | nomic-ai/nomic-embed-text-v1.5-GGUF     | Q8_0   | embed
+EOF
+)
+
+say(){ printf '%s\n' "$*"; }
+
+list_registered() {
+  if [ -f /etc/llama-swap/config.yaml ]; then
+    python3 - <<'PY'
+import yaml
+try:
+    cfg = yaml.safe_load(open("/etc/llama-swap/config.yaml")) or {}
+except Exception as e:
+    print(f"(could not read config: {e})")
+    raise SystemExit
+for name in (cfg.get("models") or {}):
+    print(f"  - {name}")
+PY
+  else
+    say "  (no /etc/llama-swap/config.yaml yet)"
+  fi
+}
+
+do_curated() {
+  local line repo quant kind name
+  line=$(echo "$CURATED" | fzf --header "curated models (Tab/Enter to pick)" --delimiter '|') || return 0
+  [ -n "$line" ] || return 0
+  name=$(echo "$line"  | awk -F'|' '{print $1}' | xargs)
+  repo=$(echo "$line"  | awk -F'|' '{print $2}' | xargs)
+  quant=$(echo "$line" | awk -F'|' '{print $3}' | xargs)
+  kind=$(echo "$line"  | awk -F'|' '{print $4}' | xargs)
+  fiehnlab-pull-model "$repo" "$quant" "$name"
+}
+
+do_search() {
+  local q repo
+  read -rp "Search Hugging Face for (e.g. 'llama 3b instruct'): " q
+  [ -n "$q" ] || return 0
+  say "searching (gguf only) ..."
+  repo=$(curl -fsS "https://huggingface.co/api/models?search=$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$q")&filter=gguf&limit=40" \
+    | python3 -c '
+import json,sys
+for m in json.load(sys.stdin):
+    print(f"{m[\"id\"]} | downloads={m.get(\"downloads\",0)} gated={m.get(\"gated\")}")
+' | fzf --header "pick a repo") || return 0
+  [ -n "$repo" ] || return 0
+  repo=$(echo "$repo" | awk -F'|' '{print $1}' | xargs)
+  say "files in $repo:"
+  FILES=$(curl -fsS "https://huggingface.co/api/models/$repo" \
+    | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for s in d.get("siblings",[]):
+    if s["rfilename"].endswith(".gguf"):
+        print(s["rfilename"])
+')
+  [ -n "$FILES" ] || { say "no .gguf files found in $repo (or it is gated/private)."; return 0; }
+  local file alias
+  file=$(echo "$FILES" | fzf --header "pick a quant/file") || return 0
+  [ -n "$file" ] || return 0
+  read -rp "local alias to serve it as [default: derived from filename]: " alias
+  fiehnlab-pull-model "$repo" "$file" "$alias"
+}
+
+do_llamacpp_hf_pull() {
+  local repoquant
+  read -rp "repo:QUANT for llama.cpp's built-in -hf pull (e.g. Qwen/Qwen3-8B-GGUF:Q4_K_M): " repoquant
+  [ -n "$repoquant" ] || return 0
+  DIR="$(fiehnlab_pick_model_dir)"
+  export LLAMA_CACHE="${LLAMA_CACHE:-$DIR/.llama-cache}"
+  mkdir -p "$LLAMA_CACHE"
+  say "pulling via llama.cpp's own -hf resolver into LLAMA_CACHE=$LLAMA_CACHE ..."
+  say "(this runs the model directly, one-shot, on an ad-hoc port - not via llama-swap)"
+  fiehnlab-llama llama-cli -hf "$repoquant" -p "say hi" -n 32
+}
+
+while true; do
+  CHOICE=$(printf '%s\n' \
+    "1) curated presets" \
+    "2) search Hugging Face (gguf)" \
+    "3) llama.cpp built-in -hf pull (one-shot, bypasses llama-swap)" \
+    "4) list models currently registered in llama-swap" \
+    "5) open llama-swap UI info (http://127.0.0.1:9090)" \
+    "q) quit" \
+    | fzf --header "fiehnlab-models" --height=40%) || break
+  case "$CHOICE" in
+    1*) do_curated ;;
+    2*) do_search ;;
+    3*) do_llamacpp_hf_pull ;;
+    4*) list_registered ;;
+    5*) say "llama-swap: http://127.0.0.1:9090  (OpenAI-compatible /v1 once a model is registered)" ;;
+    q*|"") break ;;
+  esac
+done

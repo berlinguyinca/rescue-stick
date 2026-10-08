@@ -1,0 +1,24 @@
+# fiehnlab provisioning USB — bootable systems manifest.
+#
+# One line per system. Pipe-delimited, '#' comments and blank lines ignored.
+# Columns:
+#   role      short id; the autoinstall seed is written to /ventoy/<role>-user-data
+#   iso       the ISO filename as it should appear on the stick (Ventoy shows these)
+#   source    where forge-stick.sh gets the ISO when it's missing from staging:
+#               url:<URL>          download it
+#               file:<path>        copy from a local path (built elsewhere)
+#               built:<builder>    produced by a repo builder (forge won't auto-run heavy builds;
+#                                  build it, drop the result in staging as <iso>)
+#   seed      autoinstall template relative to provision/ , or '-' for none
+#             (templates render @@PRIMARY_USER@@ / @@USER_PW_HASH@@ / @@SSH_AUTHORIZED_KEY@@ / @@LLM_GATEWAY_URL@@; see README)
+#
+# To ADD a system: append a line here, put its ISO in the staging dir
+# (default ~/fiehnlab-stick/isos/), then:  ./forge-stick.sh sync <device|mount>
+#
+# role|iso|source|seed
+gpu-node|ubuntu-24.04.5-live-server-amd64.iso|url:https://releases.ubuntu.com/24.04/ubuntu-24.04.5-live-server-amd64.iso|autoinstall/gpu-node.user-data.tmpl
+desktop|ubuntu-24.04.5.1-desktop-amd64.iso|url:https://releases.ubuntu.com/24.04/ubuntu-24.04.5.1-desktop-amd64.iso|autoinstall/desktop.user-data.tmpl
+fiehnlab-live|fiehnlab-live.iso|built:provision/live-rescue/build-live.sh|-
+rocky-kvm-node|Rocky-9.8-ks-kvm-node-12.iso|file:|-
+rocky-kvm-recovery|Rocky-9.8-ks-kvm-node-12-recovery.iso|file:|-
+rocky-minimal|Rocky-9.8-x86_64-minimal.iso|url:https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9.8-x86_64-minimal.iso|-

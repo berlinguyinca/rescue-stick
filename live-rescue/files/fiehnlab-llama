@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# GPU-detect exec wrapper around llama.cpp's prebuilt binaries. This is a
+# PORTABLE rescue stick booting on UNKNOWN target hardware - it ships two
+# userspace-only llama.cpp builds (no driver packages, see
+# payload_llamacpp() in build-live.sh) and picks between them AT RUNTIME,
+# on THIS boot's actual hardware:
+#
+#   1. NVIDIA present AND the proprietary driver is actually loaded
+#      (nvidia-smi answers) -> the cuda build, -ngl 999 (full GPU offload).
+#   2. else a REAL discrete Vulkan device enumerates (AMD/Intel via stock
+#      Mesa) -> the vulkan build, -ngl 999. Explicitly EXCLUDES
+#      llvmpipe/lavapipe (Mesa's software Vulkan rasterizer - QEMU exposes
+#      this as a "device" and it is slower than plain CPU inference, see
+#      llamacpp-community-tuning-claims-dont-transfer).
+#   3. else -> CPU only, -ngl 0. Reuses the vulkan build's own binary for
+#      this (every llama.cpp release build, cuda or vulkan, bundles the
+#      same ggml-cpu*.so backends - the vulkan tarball is the smaller of
+#      the two installed trees, and ggml dlopen's the vulkan backend lazily
+#      so running with -ngl 0 and no real Vulkan device never touches it).
+#
+# Override: FIEHNLAB_LLAMA_BACKEND=cuda|vulkan|cpu forces a choice (used by
+# the build script itself, which must force "cpu" - the chroot can see the
+# BUILD HOST's /dev/nvidia* and real GPU through shared /proc+/sys, but has
+# no driver installed inside it, so an auto-probe at build time would be
+# measuring the wrong machine).
+#
+# Usage: fiehnlab-llama <llama-server|llama-cli> [args...]
+set -uo pipefail
+
+ROOT=/opt/llama.cpp
+LOG(){ printf '[fiehnlab-llama] %s\n' "$*" >&2; }
+
+[ $# -ge 1 ] || { LOG "usage: fiehnlab-llama <llama-server|llama-cli> [args...]"; exit 1; }
+PROG="$1"; shift
+
+have_cuda() {
+  [ -x "$ROOT/cuda/$PROG" ] || return 1
+  command -v nvidia-smi >/dev/null 2>&1 || return 1
+  nvidia-smi -L 2>/dev/null | grep -qi '^GPU '
+}
+
+have_real_vulkan() {
+  local bin="$ROOT/vulkan/llama-server"
+  [ -x "$bin" ] || return 1
+  local out
+  # `timeout` guards against a probe that hangs on a quirky ICD (e.g. the
+  # lavapipe software device QEMU exposes): a hung probe would otherwise stall
+  # llama-chat/llama-embed startup forever (seen as "service never binds").
+  out=$(LD_LIBRARY_PATH="$ROOT/vulkan" timeout 10 "$bin" --list-devices 2>/dev/null) || return 1
+  # Keep only lines naming an actual device, drop the software rasterizers.
+  echo "$out" | grep -iE '^  (Vulkan|vk)[0-9]+:' | grep -viE 'llvmpipe|lavapipe' | grep -q .
+}
+
+pick_backend() {
+  case "${FIEHNLAB_LLAMA_BACKEND:-}" in
+    cuda|vulkan|cpu) echo "${FIEHNLAB_LLAMA_BACKEND}"; return ;;
+    "" ) ;;
+    * ) LOG "unknown FIEHNLAB_LLAMA_BACKEND='${FIEHNLAB_LLAMA_BACKEND}', ignoring (auto-detecting)" ;;
+  esac
+  if have_cuda; then echo cuda; return; fi
+  if have_real_vulkan; then echo vulkan; return; fi
+  echo cpu
+}
+
+BACKEND="$(pick_backend)"
+case "$BACKEND" in
+  cuda)
+    DIR="$ROOT/cuda"; NGL=999 ;;
+  vulkan)
+    DIR="$ROOT/vulkan"; NGL=999 ;;
+  cpu)
+    DIR="$ROOT/vulkan"; NGL=0 ;;
+  *)
+    LOG "FATAL: internal error picking a backend"; exit 1 ;;
+esac
+
+BIN="$DIR/$PROG"
+[ -x "$BIN" ] || { LOG "FATAL: $BIN not found/executable (backend=$BACKEND)"; exit 1; }
+LOG "backend=$BACKEND bin=$BIN -ngl $NGL"
+export LD_LIBRARY_PATH="$DIR:${LD_LIBRARY_PATH:-}"
+exec "$BIN" -ngl "$NGL" "$@"

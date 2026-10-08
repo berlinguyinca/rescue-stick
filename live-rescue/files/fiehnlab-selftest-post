@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Boot-verification helper, run unconditionally right after fiehnlab-selftest
+# by fiehnlab-selftest.service's ExecStart (chained with `;`, not a separate
+# ExecStopPost= - this unit is Type=oneshot + RemainAfterExit=yes, so it goes
+# straight to "active (exited)" after ExecStart and ExecStopPost would only
+# fire much later, at actual unit stop/shutdown, which is too late for a
+# boot-time serial read).
+#
+# Purpose: tell a genuine path/probe bug (llama-chat/llama-embed never bind)
+# apart from a timing false negative (fiehnlab-selftest's own bounded
+# health-wait loops gave up while an 8B model was still loading off a slow
+# emulated CD). Dumps the two units' journal plus one more direct probe of
+# both ports, mirrored to the serial console exactly like the main selftest.
+set -uo pipefail
+
+echo "===== fiehnlab-selftest-post: llama-chat/llama-embed journal + late probe ====="
+sudo -n journalctl -b -u llama-chat -u llama-embed --no-pager 2>&1 | tail -n 200
+echo "--- bind-failure count this boot (llama-embed) ---"
+sudo -n journalctl -b -u llama-embed --no-pager 2>&1 | grep -c "couldn't bind" || true
+echo "--- ss -ltnp: who holds :8081 / :18081 / :8080 now ---"
+sudo -n ss -ltnp 2>&1 | grep -E ':(8080|8081|18081)\b|State' || echo "(no listener matched 8080/8081/18081)"
+echo "--- late curl 127.0.0.1:8080/v1/models ---"
+curl -fsS --max-time 10 http://127.0.0.1:8080/v1/models 2>&1
+echo
+echo "--- late curl 127.0.0.1:18081/v1/embeddings (dim probe) ---"
+curl -fsS --max-time 10 http://127.0.0.1:18081/v1/embeddings \
+  -H 'content-type: application/json' \
+  -d '{"model":"nomic-embed-text","input":"post-selftest probe"}' 2>&1
+echo
+echo "===== end fiehnlab-selftest-post ====="

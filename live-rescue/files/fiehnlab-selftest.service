@@ -1,0 +1,37 @@
+[Unit]
+Description=fiehnlab-live boot selftest, mirrored to the serial console
+# Headless/remote-debug convenience: a rescue stick is often plugged into a
+# box with no monitor, or verified over QEMU's serial console (see the
+# build's own QEMU verification notes) - this makes the full
+# fiehnlab-selftest OK/FAILED/FATAL report show up on ttyS0 (if present;
+# a harmless no-op on hardware with no serial port) without anyone having
+# to open a terminal first.
+# NOTE: deliberately NOT "After=graphical.target" - WantedBy=graphical.target
+# below already makes systemd synthesize an implicit Before=graphical.target
+# on this unit (any unit pulled in via a target's .wants/ gets an automatic
+# ordering dependency on that target unless DefaultDependencies=no). Adding
+# an explicit After=graphical.target on top of that creates a 2-node
+# ordering cycle (graphical.target <-> this unit); systemd breaks such
+# cycles by dropping one of the jobs, which silently drops this unit from
+# the boot and makes the serial mirror look broken for the wrong reason.
+After=llama-chat.service llama-embed.service network-online.target
+Wants=llama-chat.service llama-embed.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+User=ubuntu
+Group=ubuntu
+# /dev/ttyS0 is group "dialout" on Ubuntu (udev rule) - without this the
+# tee to ttyS0 below silently no-ops (write fails, tee keeps going) because
+# the service user is not a member of dialout.
+SupplementaryGroups=dialout
+Environment=HOME=/home/ubuntu
+# Chained with `;` (not a separate ExecStart= line, and not ExecStopPost= -
+# see fiehnlab-selftest-post's own header) so the journal+late-probe dump
+# always runs right after the main selftest, regardless of its exit status,
+# and still lands on the serial console before the unit goes "active (exited)".
+ExecStart=/bin/bash -c '/usr/local/bin/fiehnlab-selftest 2>&1 | tee -a /dev/ttyS0 /home/ubuntu/fiehnlab-selftest.log; /usr/local/bin/fiehnlab-selftest-post 2>&1 | tee -a /dev/ttyS0 /home/ubuntu/fiehnlab-selftest.log'
+
+[Install]
+WantedBy=graphical.target
