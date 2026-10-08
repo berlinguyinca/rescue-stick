@@ -56,12 +56,23 @@ def ensure_key(path):
     if os.path.exists(path):
         return
     os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
     old = os.umask(0o077)
     try:
-        _openssl(["genpkey", "-algorithm", "ed25519", "-out", path])
+        _openssl(["genpkey", "-algorithm", "ed25519", "-out", tmp])
+        os.chmod(tmp, 0o600)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
     finally:
         os.umask(old)
-    os.chmod(path, 0o600)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def public_hex(path):
@@ -89,7 +100,7 @@ LSPCI_GPU = re.compile(
     r"(.*) \[([0-9a-f]{4}):[0-9a-f]{4}\]")
 NVIDIA_QUERY = "index,uuid,name,memory.total,driver_version,pci.bus_id"
 SKIP_DISK = ("loop", "ram", "zram", "sr", "fd", "dm-", "md")
-SKIP_NIC = ("lo", "docker", "veth", "br-", "virbr", "tailscale")
+SKIP_NIC = ("lo", "docker", "veth", "br-", "virbr", "tailscale", "podman", "cni", "flannel", "cali")
 
 
 def default_run(cmd):
@@ -227,27 +238,54 @@ class GatewayError(Exception):
         self.status = status
 
 
+MAX_RESPONSE = 1 << 20
+
+
+def _error_detail(err):
+    """`error.code` and `error.message` from a gateway error body, truncated. Never the request."""
+    try:
+        e = json.loads(err.read(4096)).get("error", {})
+        code, msg = str(e.get("code", "")), str(e.get("message", ""))
+    except (ValueError, AttributeError, OSError):
+        return ""
+    return f" ({code}: {msg[:160]})" if code or msg else ""
+
+
 def post(base, path, body, timeout=15):
     data = json.dumps(body).encode()
     req = urllib.request.Request(base + path, data=data, method="POST",
                                  headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read() or b"{}")
+            return json.loads(resp.read(MAX_RESPONSE) or b"{}")
     except urllib.error.HTTPError as e:
-        raise GatewayError(f"{path}: HTTP {e.code}", e.code) from e
+        raise GatewayError(f"{path}: HTTP {e.code}{_error_detail(e)}", e.code) from e
     except (urllib.error.URLError, OSError, ValueError) as e:
         raise GatewayError(f"{path}: {e}") from e
+
+
+def _object(value, what):
+    if not isinstance(value, dict):
+        raise GatewayError(f"{what}: response is not a JSON object")
+    return value
 
 
 def enroll(base, key_path):
     pub = public_hex(key_path)
     node_id = node_id_for(pub)
     post(base, "/v1/node/key", {"nodeId": node_id, "publicKey": pub})
-    ch = post(base, "/v1/node/challenge", {"nodeId": node_id, "role": ROLE})
-    sig = sign_hex(key_path, proof_transcript(ch["challengeId"], ch["nonce"], ch["claim"]))
-    return post(base, "/v1/node/proof", {"nodeId": node_id, "challengeId": ch["challengeId"],
-                                         "claim": ch["claim"], "signature": sig})
+    ch = _object(post(base, "/v1/node/challenge", {"nodeId": node_id, "role": ROLE}), "challenge")
+    cid, nonce, claim = ch.get("challengeId"), ch.get("nonce"), ch.get("claim")
+    if not isinstance(cid, str) or isinstance(nonce, bool) or not isinstance(nonce, int) \
+            or not 0 <= nonce < 1 << 64 or not isinstance(claim, dict) \
+            or not isinstance(claim.get("role"), str):
+        raise GatewayError("/v1/node/challenge: malformed challenge")
+    sig = sign_hex(key_path, proof_transcript(cid, nonce, claim))
+    proved = _object(post(base, "/v1/node/proof", {"nodeId": node_id, "challengeId": cid,
+                                                   "claim": claim, "signature": sig}), "proof")
+    if not isinstance(proved.get("credential"), str) or not proved["credential"]:
+        raise GatewayError("/v1/node/proof: no credential in response")
+    return proved
 
 
 def register_body(node_id, credential, report):
@@ -263,13 +301,17 @@ def register_body(node_id, credential, report):
 
 
 def register(base, body):
-    return post(base, "/v1/node/register", body)
+    resp = _object(post(base, "/v1/node/register", body), "register")
+    if not isinstance(resp.get("connectionId"), str) or not resp["connectionId"]:
+        raise GatewayError("/v1/node/register: no connectionId in response")
+    return resp
 
 
 def heartbeat(base, node_id, connection_id):
     return post(base, "/v1/node/heartbeat", {
         "nodeId": node_id, "connectionId": connection_id,
-        "status": {"busySlots": 0, "queueDepth": 0, "residentModels": []}})
+        "status": {"busySlots": 0, "queueDepth": 0, "residentModels": [],
+                   "occupancyUnmeasured": True}})
 
 
 # ---------------------------------------------------------------- worker
@@ -290,6 +332,13 @@ def parse_gateways(text):
             if url and url not in urls:
                 urls.append(url)
     return urls
+
+
+def _interval(ttl):
+    try:
+        return max(5.0, float(ttl) / 3)
+    except (TypeError, ValueError):
+        return 10.0
 
 
 def _report_hash(report):
@@ -321,45 +370,57 @@ class Worker:
             return None
 
     def _save(self):
-        fd = os.open(self.state_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        tmp = self.state_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
             json.dump({"nodeId": self.node_id, "credential": self.credential}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.state_path)
 
-    def _forget_credential(self):
+    def _set_credential_aside(self):
+        """Keep a rejected credential as <state>.old: it is revealed once and cannot be re-fetched."""
         self.credential = None
         self.registered = False
         try:
-            os.remove(self.state_path)
+            os.replace(self.state_path, self.state_path + ".old")
         except OSError:
             pass
 
     def step(self):
+        phase = "enroll"
+        fresh = False
         try:
             if not self.credential:
                 cred = enroll(self.url, self.key_path)
+                fresh = True
                 self.credential = cred["credential"]
                 self._save()
                 self.log(f"OK: enrolled {self.node_id} with {self.url}")
             report = self.get_report()
             digest = _report_hash(report)
             if not self.registered or digest != self.registered_hash:
+                phase = "register"
                 resp = register(self.url, register_body(self.node_id, self.credential, report))
                 self.connection_id = resp["connectionId"]
-                self.interval = max(5.0, float(resp.get("freshnessTtlSecs", 30)) / 3)
+                self.interval = _interval(resp.get("freshnessTtlSecs"))
                 self.registered, self.registered_hash = True, digest
                 self.log(f"OK: registered {self.node_id} with {self.url}"
                          f" ({len(report['gpus'])} GPU(s))")
             else:
+                phase = "heartbeat"
                 heartbeat(self.url, self.node_id, self.connection_id)
             self.backoff = BACKOFF_START
             return self.interval
         except GatewayError as e:
-            if e.status in (401, 403):
-                self._forget_credential()
-            elif e.status == 404:
+            if phase == "heartbeat":
+                # Rust answers 401 for a superseded or unknown connection. The credential is
+                # fine; register again with it (a second proof would be refused).
                 self.registered = False
+            elif phase == "register" and e.status in (401, 403) and not fresh:
+                self._set_credential_aside()
             self.log(f"FAILED: {self.url}: {e}")
-        except (KeyError, ValueError, subprocess.SubprocessError, OSError) as e:
+        except Exception as e:  # a hostile or buggy gateway must never end this worker
             self.log(f"FAILED: {self.url}: unexpected {type(e).__name__}: {e}")
         wait = self.backoff
         self.backoff = min(self.backoff * 2, BACKOFF_MAX)
@@ -387,14 +448,41 @@ def make_logger(path):
 
 
 class ReportCache:
-    def __init__(self):
-        self.lock, self.value, self.at = threading.Lock(), None, 0.0
+    """Serves the last hardware report; refreshes in the background so a stuck tool cannot stall heartbeats."""
+
+    def __init__(self, collector=None, ttl=REPORT_TTL):
+        self.collector = collector or collect
+        self.ttl = ttl
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.value, self.at, self.refreshing = None, 0.0, False
+
+    def _refresh(self):
+        try:
+            value = self.collector()
+            with self.lock:
+                self.value, self.at = value, time.monotonic()
+            self.ready.set()
+        finally:
+            with self.lock:
+                self.refreshing = False
 
     def get(self):
         with self.lock:
-            if self.value is None or time.monotonic() - self.at > REPORT_TTL:
-                self.value, self.at = collect(), time.monotonic()
+            stale = self.value is None or time.monotonic() - self.at >= self.ttl
+            start = stale and not self.refreshing
+            if start:
+                self.refreshing = True
+            have = self.value
+        if have is None:
+            if start:
+                self._refresh()
+            elif not self.ready.wait(120):
+                raise RuntimeError("hardware scan is still running")
             return self.value
+        if start:
+            threading.Thread(target=self._refresh, daemon=True).start()
+        return have
 
 
 def run_worker(worker, stop):
@@ -424,9 +512,14 @@ def main(argv=None):
 
     key_path = os.path.join(args.state_dir, "node-key")
     existed = os.path.exists(key_path)
-    ensure_key(key_path)
-    log(f"{'using existing' if existed else 'generated new'} identity "
-        f"{node_id_for(public_hex(key_path))}")
+    try:
+        ensure_key(key_path)
+        identity = node_id_for(public_hex(key_path))
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"FAILED: identity key {key_path} is unusable ({type(e).__name__}); "
+            f"not replacing it. Fix or remove it deliberately: a new key is a new node")
+        return 2
+    log(f"{'using existing' if existed else 'generated new'} identity {identity}")
 
     cache = ReportCache()
     workers = [Worker(u, key_path, args.state_dir, cache.get, log) for u in urls]

@@ -512,7 +512,7 @@ autoinstall:
         content: |
           [Unit]
           Description=Register this node and its hardware with InferWeave gateways
-          After=network-online.target fiehnlab-gpu-container.service
+          After=network-online.target
           Wants=network-online.target
           [Service]
           ExecStart=/usr/local/sbin/fiehnlab-register
@@ -534,7 +534,7 @@ autoinstall:
     runcmd:
       - [ bash, /usr/local/sbin/fiehnlab-harden.sh ]
       - [ systemctl, enable, fiehnlab-gpu-container.service ]
-      - [ systemctl, enable, fiehnlab-register.service ]
+      - [ systemctl, enable, --now, --no-block, fiehnlab-register.service ]
 
   # Reboot into the installed system when done
   shutdown: reboot

@@ -52,6 +52,9 @@ load_config(){
   if [ -z "$SSH_AUTHORIZED_KEY" ] && [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
     SSH_AUTHORIZED_KEY="$(cat "$HOME/.ssh/id_ed25519.pub")"
   fi
+  # NODE_GATEWAYS goes through sed into the seed: allow only URL characters and commas.
+  printf '%s' "$NODE_GATEWAYS" | grep -qE '^[A-Za-z0-9:/._,-]+$' \
+    || die "NODE_GATEWAYS may contain only letters, digits and : / . _ , - (comma-separated URLs); got: $NODE_GATEWAYS"
   local miss=""
   [ -n "$PRIMARY_USER" ]       || miss="$miss PRIMARY_USER"
   [ -n "$USER_PW_HASH" ]       || miss="$miss USER_PW_HASH"

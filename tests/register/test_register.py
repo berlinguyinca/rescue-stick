@@ -1,5 +1,5 @@
 # tests/register/test_register.py
-import hashlib, importlib.machinery, importlib.util, json, os, stat, subprocess, tempfile, unittest
+import threading, hashlib, importlib.machinery, importlib.util, json, os, stat, subprocess, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 AGENT = os.path.join(HERE, "..", "..", "autoinstall", "files", "fiehnlab-register")
@@ -185,6 +185,8 @@ class MockGateway:
         self.keys, self.challenges, self.creds = {}, {}, {}
         self.registered, self.heartbeats = [], []
         self.fail_status = None  # force every request to this status
+        self.reject_register = False
+        self.raw_override = None  # (status, bytes) returned for every request
         self.calls = []
         mock = self
 
@@ -195,6 +197,12 @@ class MockGateway:
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 mock.calls.append((self.path, body))
+                if mock.raw_override:
+                    st, raw = mock.raw_override
+                    self.send_response(st)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    return self.wfile.write(raw)
                 if mock.fail_status:
                     return self.reply(mock.fail_status, {"error": {"code": "forced"}})
                 status, out = mock.handle(self.path, body)
@@ -227,6 +235,8 @@ class MockGateway:
             return 200, {"challengeId": cid, "nonce": 42, "claim": claim, "expiresAt": 9999999999}
         if path == "/v1/node/proof":
             node, nonce, claim = self.challenges[b["challengeId"]]
+            if node in self.creds.values():
+                return 401, {"error": {"code": "already_enrolled", "message": "node already holds a credential"}}
             if b["claim"] != claim:
                 return 401, {"error": {"code": "claim_mismatch"}}
             msg = fr.proof_transcript(b["challengeId"], nonce, claim)
@@ -238,12 +248,14 @@ class MockGateway:
         if path == "/v1/node/register":
             if self.creds.get(b["credential"]) != b["nodeId"]:
                 return 401, {"error": {"code": "unauthorized"}}
+            if self.reject_register:
+                return 400, {"error": {"code": "bad_request", "message": "deployment id is not valid"}}
             self.registered.append(b)
             return 200, {"nodeId": b["nodeId"], "connectionId": f"conn-{len(self.registered)}",
                          "freshnessTtlSecs": 30, "capabilities": []}
         if path == "/v1/node/heartbeat":
             if not b["connectionId"].startswith("conn-"):
-                return 404, {"error": {"code": "unknown_connection"}}
+                return 401, {"error": {"code": "unauthorized"}}
             self.heartbeats.append(b)
             return 200, {"status": "ok"}
         return 404, {}
@@ -281,7 +293,8 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(resp["connectionId"], "conn-1")
         fr.heartbeat(self.gw.url, cred["nodeId"], resp["connectionId"])
         self.assertEqual(self.gw.heartbeats[0]["status"],
-                         {"busySlots": 0, "queueDepth": 0, "residentModels": []})
+                         {"busySlots": 0, "queueDepth": 0, "residentModels": [],
+                          "occupancyUnmeasured": True})
 
     def test_http_errors_become_gateway_errors_with_status(self):
         self.gw.fail_status = 503
@@ -362,13 +375,51 @@ class WorkerTests(unittest.TestCase):
         self.assertTrue(w.registered)
         self.assertEqual(len(self.gw.registered), 2)
 
-    def test_unknown_connection_re_registers(self):
+    def test_unknown_connection_re_registers_with_the_same_credential(self):
         w = self.worker()
         w.step()
+        cred = w.credential
         w.connection_id = "gone"
-        w.step()           # heartbeat 404 -> mark unregistered
+        self.gw.calls.clear()
+        w.step()           # heartbeat 401 (Rust answers 401, not 404) -> unregistered, credential kept
         w.step()
         self.assertEqual(len(self.gw.registered), 2)
+        self.assertEqual(w.credential, cred)
+        self.assertNotIn("/v1/node/key", [p for p, _ in self.gw.calls], "no re-proof: Rust refuses a second one")
+
+    def test_dropped_credential_is_set_aside_not_deleted(self):
+        w = self.worker()
+        w.step()
+        self.gw.creds.clear()
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register 401 on a credential loaded earlier -> set aside
+        self.assertIsNone(w.credential)
+        self.assertTrue(os.path.exists(w.state_path + ".old"))
+
+    def test_refused_re_proof_is_logged_and_does_not_spin(self):
+        w = self.worker()
+        w.step()
+        # the gateway still binds a credential to this node, but ours is no longer valid
+        self.gw.creds = {"someone-elses-secret": w.node_id}
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register 401 -> credential set aside
+        wait = w.step()    # re-proof refused (already_enrolled)
+        self.assertFalse(w.registered)
+        self.assertTrue(any("already_enrolled" in l for l in self.lines), self.lines)
+        self.assertGreaterEqual(wait, 5)
+
+    def test_gateway_error_code_reaches_the_log(self):
+        self.gw.reject_register = True
+        w = self.worker()
+        w.step()
+        self.assertTrue(any("bad_request" in l and "deployment id" in l for l in self.lines), self.lines)
+
+    def test_state_file_is_written_atomically(self):
+        w = self.worker()
+        w.step()
+        names = os.listdir(os.path.dirname(w.state_path))
+        self.assertEqual([n for n in names if ".tmp" in n], [])
+        self.assertEqual(stat.S_IMODE(os.stat(w.state_path).st_mode), 0o600)
 
     def test_failure_backs_off_and_logs_failed(self):
         self.gw.fail_status = 503
@@ -387,6 +438,92 @@ class WorkerTests(unittest.TestCase):
         live.step()
         self.assertFalse(dead.registered)
         self.assertTrue(live.registered)
+
+
+HOSTILE = [b"[]", b"null", b"not json", b'"str"',
+           b'{"challengeId": 5, "nonce": 1, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": "x", "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": -1, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": 18446744073709551616, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": 1, "claim": {"role": null}}',
+           b'{"challengeId": "c", "nonce": 1, "claim": []}',
+           b'{"credential": 7}']
+
+
+class HostileGatewayTests(unittest.TestCase):
+    def test_malformed_200s_never_escape_step(self):
+        gw = MockGateway()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                key = os.path.join(d, "node-key")
+                fr.ensure_key(key)
+                lines = []
+                for body in HOSTILE:
+                    gw.raw_override = (200, body)
+                    w = fr.Worker(gw.url, key, d, lambda: fr.collect(*fake_env()), lines.append)
+                    wait = w.step()
+                    self.assertIsInstance(wait, float, body)
+                    self.assertFalse(w.registered, body)
+                self.assertGreaterEqual(len([l for l in lines if l.startswith("FAILED:")]), len(HOSTILE))
+        finally:
+            gw.stop()
+
+    def test_bad_registration_response_is_a_failure_not_a_crash(self):
+        gw = MockGateway()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                key = os.path.join(d, "node-key")
+                fr.ensure_key(key)
+                w = fr.Worker(gw.url, key, d, lambda: fr.collect(*fake_env()), lambda l: None)
+                w.step()  # enrolled + registered
+                gw.raw_override = (200, b'{"connectionId": "c", "freshnessTtlSecs": null}')
+                w.registered = False
+                self.assertIsInstance(w.step(), float)
+        finally:
+            gw.stop()
+
+
+class KeyFileTests(unittest.TestCase):
+    def test_ensure_key_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            fr.ensure_key(os.path.join(d, "node-key"))
+            self.assertEqual(os.listdir(d), ["node-key"])
+
+    def test_corrupt_key_is_logged_and_never_replaced(self):
+        with tempfile.TemporaryDirectory() as d:
+            gfile = os.path.join(d, "gw.list")
+            with open(gfile, "w") as f:
+                f.write("http://127.0.0.1:9\n")
+            key = os.path.join(d, "node-key")
+            open(key, "w").close()  # a 0-byte key, e.g. after a power cut
+            log = os.path.join(d, "log")
+            rc = fr.main(["--gateways-file", gfile, "--state-dir", d, "--log-file", log, "--once"])
+            self.assertEqual(rc, 2)
+            self.assertEqual(os.path.getsize(key), 0, "an unreadable key must not be silently replaced")
+            text = open(log).read()
+            self.assertIn("FAILED", text)
+            self.assertIn(key, text)
+
+
+class ReportCacheTests(unittest.TestCase):
+    def test_refresh_does_not_block_readers(self):
+        import time as _t
+        gate = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            if len(calls) > 1:
+                gate.wait(5)
+            return {"version": 1, "n": len(calls)}
+
+        cache = fr.ReportCache(slow, ttl=0.0)
+        first = cache.get()
+        started = _t.monotonic()
+        second = cache.get()        # stale -> refresh runs in the background
+        self.assertLess(_t.monotonic() - started, 1.0, "reader must not wait for the scan")
+        self.assertEqual(second, first)
+        gate.set()
 
 
 class CliTests(unittest.TestCase):

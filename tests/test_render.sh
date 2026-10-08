@@ -28,6 +28,40 @@ assert got == want, "embedded agent differs from source"
 compile(got.decode(), "fiehnlab-register", "exec")
 PY
 
+# The register unit must not be ordered after the GPU container unit: that unit is After=multi-user.target
+# and both are WantedBy=multi-user.target, which is an ordering cycle systemd breaks by deleting a job.
+python3 - "$S" "$T/units" <<'PY'
+import re, sys, yaml, os
+seed = yaml.safe_load(open(sys.argv[1]))
+def walk(o):
+    if isinstance(o, dict):
+        if "write_files" in o: return o["write_files"]
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+files = {e["path"]: e["content"] for e in walk(seed)}
+unit = files["/etc/systemd/system/fiehnlab-register.service"]
+assert "fiehnlab-gpu-container" not in unit, "register unit is ordered after the GPU unit (ordering cycle)"
+os.makedirs(sys.argv[2])
+for path, content in files.items():
+    if path.startswith("/etc/systemd/system/"):
+        open(os.path.join(sys.argv[2], os.path.basename(path)), "w").write(content)
+open(os.path.join(sys.argv[2], "fiehnlab-gpu-container.service"), "w").write(files["/etc/systemd/system/fiehnlab-gpu-container.service"])
+# first boot must actually start the service
+rc = seed["autoinstall"]["user-data"]["runcmd"]
+assert any(c[:2] == ["systemctl", "enable"] and "--now" in c and "fiehnlab-register.service" in c for c in rc if isinstance(c, list)), \
+    "runcmd does not start fiehnlab-register on the first boot"
+PY
+if command -v systemd-analyze >/dev/null; then
+  out="$(cd "$T/units" && systemd-analyze verify --man=no ./fiehnlab-register.service ./fiehnlab-gpu-container.service 2>&1 || true)"
+  if echo "$out" | grep -qi "ordering cycle"; then fail "systemd ordering cycle: $out"; fi
+fi
+
+# NODE_GATEWAYS is substituted by sed: refuse anything but URL characters and commas.
+for bad in 'https://a|b' 'https://a&b' 'https://a\b' "$(printf 'https://a\nhttps://b')"; do
+  if NODE_GATEWAYS="$bad" stick/forge-stick.sh render >/dev/null 2>&1; then fail "NODE_GATEWAYS accepted: $bad"; fi
+done
+
 # An overridden list is honoured.
 NODE_GATEWAYS='https://a.example,https://b.example' stick/forge-stick.sh render >/dev/null
 grep -q 'https://b.example' "$T/stage/seeds/gpu-node-user-data" || fail "NODE_GATEWAYS override ignored"
