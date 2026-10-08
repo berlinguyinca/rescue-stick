@@ -216,3 +216,57 @@ def collect(run=default_run, read=default_read, listdir=default_listdir):
 
 def register_vram(report):
     return sum(g["vramBytes"] for g in report["gpus"])
+
+
+# ---------------------------------------------------------------- client
+
+
+class GatewayError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+def post(base, path, body, timeout=15):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as e:
+        raise GatewayError(f"{path}: HTTP {e.code}", e.code) from e
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise GatewayError(f"{path}: {e}") from e
+
+
+def enroll(base, key_path):
+    pub = public_hex(key_path)
+    node_id = node_id_for(pub)
+    post(base, "/v1/node/key", {"nodeId": node_id, "publicKey": pub})
+    ch = post(base, "/v1/node/challenge", {"nodeId": node_id, "role": ROLE})
+    sig = sign_hex(key_path, proof_transcript(ch["challengeId"], ch["nonce"], ch["claim"]))
+    return post(base, "/v1/node/proof", {"nodeId": node_id, "challengeId": ch["challengeId"],
+                                         "claim": ch["claim"], "signature": sig})
+
+
+def register_body(node_id, credential, report):
+    gpus = report["gpus"]
+    return {
+        "nodeId": node_id, "role": ROLE, "credential": credential,
+        "endpoint": "", "models": [], "deployment": "",
+        "vramBytes": register_vram(report), "kvBytes": 0, "kvBytesPerToken": 0,
+        "gpuIds": [f"gpu{g['index']}" for g in gpus],
+        "card": gpus[0]["model"] if gpus else None,
+        "capabilities": [], "hardware": report,
+    }
+
+
+def register(base, body):
+    return post(base, "/v1/node/register", body)
+
+
+def heartbeat(base, node_id, connection_id):
+    return post(base, "/v1/node/heartbeat", {
+        "nodeId": node_id, "connectionId": connection_id,
+        "status": {"busySlots": 0, "queueDepth": 0, "residentModels": []}})

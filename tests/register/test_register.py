@@ -174,5 +174,125 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(fr.register_vram({"gpus": [{"vramBytes": 3}, {"vramBytes": 4}]}), 7)
 
 
+
+import http.server, threading, secrets
+
+
+class MockGateway:
+    """Implements the Rust node protocol shapes; verifies signatures with openssl."""
+
+    def __init__(self):
+        self.keys, self.challenges, self.creds = {}, {}, {}
+        self.registered, self.heartbeats = [], []
+        self.fail_status = None  # force every request to this status
+        self.calls = []
+        mock = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                mock.calls.append((self.path, body))
+                if mock.fail_status:
+                    return self.reply(mock.fail_status, {"error": {"code": "forced"}})
+                status, out = mock.handle(self.path, body)
+                self.reply(status, out)
+
+            def reply(self, status, out):
+                data = json.dumps(out).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+
+    def handle(self, path, b):
+        if path == "/v1/node/key":
+            self.keys[b["nodeId"]] = b["publicKey"]
+            return 200, {"status": "ok"}
+        if path == "/v1/node/challenge":
+            cid = secrets.token_hex(8)
+            claim = {"role": b["role"], "model": None, "contextClass": None, "resourceClaim": None}
+            self.challenges[cid] = (b["nodeId"], 42, claim)
+            return 200, {"challengeId": cid, "nonce": 42, "claim": claim, "expiresAt": 9999999999}
+        if path == "/v1/node/proof":
+            node, nonce, claim = self.challenges[b["challengeId"]]
+            if b["claim"] != claim:
+                return 401, {"error": {"code": "claim_mismatch"}}
+            msg = fr.proof_transcript(b["challengeId"], nonce, claim)
+            if not openssl_verify(self.keys[node], msg, b["signature"]):
+                return 401, {"error": {"code": "bad_signature"}}
+            cred = secrets.token_hex(16)
+            self.creds[cred] = node
+            return 200, {"nodeId": node, "role": claim["role"], "credential": cred, "expiresAt": 9999999999}
+        if path == "/v1/node/register":
+            if self.creds.get(b["credential"]) != b["nodeId"]:
+                return 401, {"error": {"code": "unauthorized"}}
+            self.registered.append(b)
+            return 200, {"nodeId": b["nodeId"], "connectionId": f"conn-{len(self.registered)}",
+                         "freshnessTtlSecs": 30, "capabilities": []}
+        if path == "/v1/node/heartbeat":
+            if not b["connectionId"].startswith("conn-"):
+                return 404, {"error": {"code": "unknown_connection"}}
+            self.heartbeats.append(b)
+            return 200, {"status": "ok"}
+        return 404, {}
+
+
+class ClientTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.key = os.path.join(self.tmp.name, "node-key")
+        fr.ensure_key(self.key)
+        self.gw = MockGateway()
+
+    def tearDown(self):
+        self.gw.stop()
+        self.tmp.cleanup()
+
+    def report(self):
+        return fr.collect(*fake_env())
+
+    def test_enroll_earns_a_credential_without_any_token(self):
+        cred = fr.enroll(self.gw.url, self.key)
+        self.assertEqual(cred["nodeId"], fr.node_id_for(fr.public_hex(self.key)))
+        self.assertTrue(cred["credential"])
+        self.assertEqual([p for p, _ in self.gw.calls],
+                         ["/v1/node/key", "/v1/node/challenge", "/v1/node/proof"])
+
+    def test_register_body_carries_hardware_and_no_endpoint(self):
+        cred = fr.enroll(self.gw.url, self.key)
+        body = fr.register_body(cred["nodeId"], cred["credential"], self.report())
+        self.assertEqual(body["role"], "node")
+        self.assertEqual(body["models"], [])
+        self.assertEqual(body["endpoint"], "")
+        self.assertEqual(body["hardware"]["version"], 1)
+        resp = fr.register(self.gw.url, body)
+        self.assertEqual(resp["connectionId"], "conn-1")
+        fr.heartbeat(self.gw.url, cred["nodeId"], resp["connectionId"])
+        self.assertEqual(self.gw.heartbeats[0]["status"],
+                         {"busySlots": 0, "queueDepth": 0, "residentModels": []})
+
+    def test_http_errors_become_gateway_errors_with_status(self):
+        self.gw.fail_status = 503
+        with self.assertRaises(fr.GatewayError) as cm:
+            fr.enroll(self.gw.url, self.key)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_unreachable_gateway_is_a_gateway_error_without_status(self):
+        with self.assertRaises(fr.GatewayError) as cm:
+            fr.post("http://127.0.0.1:9", "/v1/node/key", {}, timeout=1)
+        self.assertIsNone(cm.exception.status)
+
+
 if __name__ == "__main__":
     unittest.main()
