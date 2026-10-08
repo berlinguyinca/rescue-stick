@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""fiehnlab-register: enroll this node with InferWeave gateways and advertise its hardware.
+
+Speaks the inferweave/inferweave node protocol: /v1/node/{key,challenge,proof}
+(tokenless proof enrollment), /v1/node/register and /v1/node/heartbeat.
+Stdlib only; Ed25519 goes through openssl.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+PROOF_DOMAIN = b"iw-proof-enrollment-v1"
+ROLE = "node"
+
+# ---------------------------------------------------------------- crypto
+
+
+def _field(data):
+    return struct.pack(">I", len(data)) + data
+
+
+def _optional(value):
+    if value is None:
+        return b"\x00"
+    return b"\x01" + _field(value.encode())
+
+
+def proof_transcript(challenge_id, nonce, claim):
+    """The exact bytes a proof signs (iw_core::signature::proof_transcript)."""
+    out = _field(PROOF_DOMAIN) + _field(challenge_id.encode())
+    out += struct.pack(">Q", nonce)
+    out += _field(claim["role"].encode())
+    out += _optional(claim.get("model"))
+    out += _optional(claim.get("contextClass"))
+    out += _optional(claim.get("resourceClaim"))
+    return out
+
+
+def _openssl(args, data=None):
+    r = subprocess.run(["openssl"] + args, input=data, capture_output=True, check=True)
+    return r.stdout
+
+
+def ensure_key(path):
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    old = os.umask(0o077)
+    try:
+        _openssl(["genpkey", "-algorithm", "ed25519", "-out", path])
+    finally:
+        os.umask(old)
+    os.chmod(path, 0o600)
+
+
+def public_hex(path):
+    der = _openssl(["pkey", "-in", path, "-pubout", "-outform", "DER"])
+    return der[-32:].hex()
+
+
+def node_id_for(pub_hex):
+    return "node_" + hashlib.sha256(bytes.fromhex(pub_hex)).hexdigest()[:16]
+
+
+def sign_hex(path, message):
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(message)
+        f.flush()
+        sig = _openssl(["pkeyutl", "-sign", "-inkey", path, "-rawin", "-in", f.name])
+    return sig.hex()
