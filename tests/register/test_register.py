@@ -1,0 +1,545 @@
+# tests/register/test_register.py
+import threading, hashlib, importlib.machinery, importlib.util, json, os, stat, subprocess, tempfile, unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+AGENT = os.path.join(HERE, "..", "..", "autoinstall", "files", "fiehnlab-register")
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader("fiehnlab_register", AGENT)
+    spec = importlib.util.spec_from_loader("fiehnlab_register", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+fr = load()
+SPKI_ED25519_PREFIX = bytes.fromhex("302a300506032b6570032100")
+
+
+def openssl_verify(pub_hex, message, sig_hex):
+    with tempfile.TemporaryDirectory() as d:
+        pub = os.path.join(d, "pub.der")
+        msg = os.path.join(d, "msg")
+        sig = os.path.join(d, "sig")
+        with open(pub, "wb") as f:
+            f.write(SPKI_ED25519_PREFIX + bytes.fromhex(pub_hex))
+        with open(msg, "wb") as f:
+            f.write(message)
+        with open(sig, "wb") as f:
+            f.write(bytes.fromhex(sig_hex))
+        r = subprocess.run(
+            ["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", pub, "-keyform", "DER",
+             "-rawin", "-in", msg, "-sigfile", sig],
+            capture_output=True)
+        return r.returncode == 0
+
+
+class IdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.key = os.path.join(self.tmp.name, "node-key")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_ensure_key_creates_private_file_once(self):
+        fr.ensure_key(self.key)
+        self.assertEqual(stat.S_IMODE(os.stat(self.key).st_mode), 0o600)
+        with open(self.key) as f:
+            first = f.read()
+        fr.ensure_key(self.key)
+        with open(self.key) as f:
+            self.assertEqual(first, f.read(), "an existing key is never replaced")
+
+    def test_public_hex_is_32_bytes_and_node_id_is_derived(self):
+        fr.ensure_key(self.key)
+        pub = fr.public_hex(self.key)
+        self.assertRegex(pub, r"^[0-9a-f]{64}$")
+        want = "node_" + hashlib.sha256(bytes.fromhex(pub)).hexdigest()[:16]
+        self.assertEqual(fr.node_id_for(pub), want)
+
+    def test_signature_verifies_with_openssl(self):
+        fr.ensure_key(self.key)
+        sig = fr.sign_hex(self.key, b"hello")
+        self.assertRegex(sig, r"^[0-9a-f]{128}$")
+        self.assertTrue(openssl_verify(fr.public_hex(self.key), b"hello", sig))
+        self.assertFalse(openssl_verify(fr.public_hex(self.key), b"other", sig))
+
+
+class TranscriptTests(unittest.TestCase):
+    def test_role_only_claim_bytes(self):
+        claim = {"role": "node", "model": None, "contextClass": None, "resourceClaim": None}
+        got = fr.proof_transcript("c1", 7, claim)
+        want = (
+            len(b"iw-proof-enrollment-v1").to_bytes(4, "big") + b"iw-proof-enrollment-v1"
+            + (2).to_bytes(4, "big") + b"c1"
+            + (7).to_bytes(8, "big")
+            + (4).to_bytes(4, "big") + b"node"
+            + b"\x00\x00\x00"
+        )
+        self.assertEqual(got, want)
+
+    def test_present_empty_differs_from_absent(self):
+        a = {"role": "node", "model": None, "contextClass": None, "resourceClaim": None}
+        b = dict(a, model="")
+        self.assertNotEqual(fr.proof_transcript("c", 1, a), fr.proof_transcript("c", 1, b))
+
+
+
+FIX = os.path.join(HERE, "fixtures")
+
+
+def fixture(name):
+    with open(os.path.join(FIX, name)) as f:
+        return f.read()
+
+
+def fake_env(files=None, cmds=None, dirs=None):
+    files, cmds, dirs = files or {}, cmds or {}, dirs or {}
+    return (
+        lambda cmd: cmds.get(tuple(cmd)),
+        lambda path: files.get(path),
+        lambda path: dirs.get(path, []),
+    )
+
+
+class CollectorTests(unittest.TestCase):
+    def test_parse_nvidia_smi(self):
+        gpus = fr.parse_nvidia_smi(fixture("nvidia-smi.csv"))
+        self.assertEqual(len(gpus), 2)
+        self.assertEqual(gpus[0]["vendor"], "nvidia")
+        self.assertEqual(gpus[0]["uuid"], "GPU-aaaa1111")
+        self.assertEqual(gpus[0]["vramBytes"], 97887 * 1024 * 1024)
+        self.assertEqual(gpus[0]["driver"], "580.65.06")
+        self.assertEqual(gpus[1]["index"], 1)
+
+    def test_parse_nvidia_smi_ignores_garbage(self):
+        self.assertEqual(fr.parse_nvidia_smi(""), [])
+        self.assertEqual(fr.parse_nvidia_smi("NVIDIA-SMI has failed\n"), [])
+        self.assertEqual(fr.parse_nvidia_smi(None), [])
+
+    def test_parse_lspci_picks_amd_and_skips_bmc_vga(self):
+        gpus = fr.parse_lspci_gpus(fixture("lspci-amd.txt"))
+        vendors = {g["pciId"]: g["vendor"] for g in gpus}
+        self.assertEqual(vendors["03:00.0"], "amd")
+        self.assertEqual(vendors["00:02.0"], "other")
+
+    def test_collect_amd_uses_sysfs_vram(self):
+        run, read, listdir = fake_env(
+            cmds={("lspci", "-nn"): fixture("lspci-amd.txt")},
+            files={
+                "/sys/bus/pci/devices/0000:03:00.0/mem_info_vram_total": "25753026560\n",
+                "/proc/meminfo": fixture("meminfo.txt"),
+                "/proc/cpuinfo": fixture("cpuinfo.txt"),
+            })
+        rep = fr.collect(run, read, listdir)
+        amd = [g for g in rep["gpus"] if g["vendor"] == "amd"]
+        self.assertEqual(len(amd), 1)
+        self.assertEqual(amd[0]["vramBytes"], 25753026560)
+        self.assertEqual(rep["cpu"], {"model": "AMD EPYC 7763 64-Core Processor", "threads": 2})
+        self.assertEqual(rep["memBytes"], 263921456 * 1024)
+
+    def test_collect_with_nothing_available_still_returns_a_report(self):
+        rep = fr.collect(*fake_env())
+        self.assertEqual(rep["version"], 1)
+        self.assertEqual(rep["gpus"], [])
+        self.assertIn("no GPU found", " ".join(rep["notes"]))
+        json.dumps(rep)
+
+    def test_collect_nvidia_smi_failing_falls_back_to_lspci(self):
+        lspci = "01:00.0 3D controller [0302]: NVIDIA Corporation GB202 [10de:2bb1] (rev a1)\n"
+        rep = fr.collect(*fake_env(cmds={("lspci", "-nn"): lspci}))
+        self.assertEqual(rep["gpus"][0]["vendor"], "nvidia")
+        self.assertEqual(rep["gpus"][0]["vramBytes"], 0)
+        self.assertIn("driver", " ".join(rep["notes"]))
+
+    def test_disks_skip_virtual_and_nics_skip_loopback(self):
+        run, read, listdir = fake_env(
+            dirs={"/sys/block": ["nvme0n1", "loop0", "zram0", "sda"],
+                  "/sys/class/net": ["lo", "eno1", "docker0", "veth12"]},
+            files={
+                "/sys/block/nvme0n1/size": "1000215216\n", "/sys/block/nvme0n1/queue/rotational": "0\n",
+                "/sys/block/sda/size": "2000000\n", "/sys/block/sda/queue/rotational": "1\n",
+                "/sys/class/net/eno1/speed": "10000\n",
+            })
+        rep = fr.collect(run, read, listdir)
+        self.assertEqual([d["name"] for d in rep["disks"]], ["nvme0n1", "sda"])
+        self.assertEqual(rep["disks"][0]["sizeBytes"], 1000215216 * 512)
+        self.assertFalse(rep["disks"][0]["rotational"])
+        self.assertTrue(rep["disks"][1]["rotational"])
+        self.assertEqual(rep["nics"], [{"name": "eno1", "speedMbps": 10000}])
+
+    def test_register_vram_sums_gpus(self):
+        self.assertEqual(fr.register_vram({"gpus": [{"vramBytes": 3}, {"vramBytes": 4}]}), 7)
+
+
+
+import http.server, threading, secrets
+
+
+class MockGateway:
+    """Implements the Rust node protocol shapes; verifies signatures with openssl."""
+
+    def __init__(self):
+        self.keys, self.challenges, self.creds = {}, {}, {}
+        self.registered, self.heartbeats = [], []
+        self.fail_status = None  # force every request to this status
+        self.reject_register = False
+        self.raw_override = None  # (status, bytes) returned for every request
+        self.calls = []
+        mock = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                mock.calls.append((self.path, body))
+                if mock.raw_override:
+                    st, raw = mock.raw_override
+                    self.send_response(st)
+                    self.send_header("Content-Length", str(len(raw)))
+                    self.end_headers()
+                    return self.wfile.write(raw)
+                if mock.fail_status:
+                    return self.reply(mock.fail_status, {"error": {"code": "forced"}})
+                status, out = mock.handle(self.path, body)
+                self.reply(status, out)
+
+            def reply(self, status, out):
+                data = json.dumps(out).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def stop(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+    def handle(self, path, b):
+        if path == "/v1/node/key":
+            self.keys[b["nodeId"]] = b["publicKey"]
+            return 200, {"status": "ok"}
+        if path == "/v1/node/challenge":
+            cid = secrets.token_hex(8)
+            claim = {"role": b["role"], "model": None, "contextClass": None, "resourceClaim": None}
+            self.challenges[cid] = (b["nodeId"], 42, claim)
+            return 200, {"challengeId": cid, "nonce": 42, "claim": claim, "expiresAt": 9999999999}
+        if path == "/v1/node/proof":
+            node, nonce, claim = self.challenges[b["challengeId"]]
+            if node in self.creds.values():
+                return 401, {"error": {"code": "already_enrolled", "message": "node already holds a credential"}}
+            if b["claim"] != claim:
+                return 401, {"error": {"code": "claim_mismatch"}}
+            msg = fr.proof_transcript(b["challengeId"], nonce, claim)
+            if not openssl_verify(self.keys[node], msg, b["signature"]):
+                return 401, {"error": {"code": "bad_signature"}}
+            cred = secrets.token_hex(16)
+            self.creds[cred] = node
+            return 200, {"nodeId": node, "role": claim["role"], "credential": cred, "expiresAt": 9999999999}
+        if path == "/v1/node/register":
+            if self.creds.get(b["credential"]) != b["nodeId"]:
+                return 401, {"error": {"code": "unauthorized"}}
+            if self.reject_register:
+                return 400, {"error": {"code": "bad_request", "message": "deployment id is not valid"}}
+            self.registered.append(b)
+            return 200, {"nodeId": b["nodeId"], "connectionId": f"conn-{len(self.registered)}",
+                         "freshnessTtlSecs": 30, "capabilities": []}
+        if path == "/v1/node/heartbeat":
+            if not b["connectionId"].startswith("conn-"):
+                return 401, {"error": {"code": "unauthorized"}}
+            self.heartbeats.append(b)
+            return 200, {"status": "ok"}
+        return 404, {}
+
+
+class ClientTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.key = os.path.join(self.tmp.name, "node-key")
+        fr.ensure_key(self.key)
+        self.gw = MockGateway()
+
+    def tearDown(self):
+        self.gw.stop()
+        self.tmp.cleanup()
+
+    def report(self):
+        return fr.collect(*fake_env())
+
+    def test_enroll_earns_a_credential_without_any_token(self):
+        cred = fr.enroll(self.gw.url, self.key)
+        self.assertEqual(cred["nodeId"], fr.node_id_for(fr.public_hex(self.key)))
+        self.assertTrue(cred["credential"])
+        self.assertEqual([p for p, _ in self.gw.calls],
+                         ["/v1/node/key", "/v1/node/challenge", "/v1/node/proof"])
+
+    def test_register_body_carries_hardware_and_no_endpoint(self):
+        cred = fr.enroll(self.gw.url, self.key)
+        body = fr.register_body(cred["nodeId"], cred["credential"], self.report())
+        self.assertEqual(body["role"], "node")
+        self.assertEqual(body["models"], [])
+        self.assertEqual(body["endpoint"], "")
+        self.assertEqual(body["hardware"]["version"], 1)
+        resp = fr.register(self.gw.url, body)
+        self.assertEqual(resp["connectionId"], "conn-1")
+        fr.heartbeat(self.gw.url, cred["nodeId"], resp["connectionId"])
+        self.assertEqual(self.gw.heartbeats[0]["status"],
+                         {"busySlots": 0, "queueDepth": 0, "residentModels": [],
+                          "occupancyUnmeasured": True})
+
+    def test_http_errors_become_gateway_errors_with_status(self):
+        self.gw.fail_status = 503
+        with self.assertRaises(fr.GatewayError) as cm:
+            fr.enroll(self.gw.url, self.key)
+        self.assertEqual(cm.exception.status, 503)
+
+    def test_unreachable_gateway_is_a_gateway_error_without_status(self):
+        with self.assertRaises(fr.GatewayError) as cm:
+            fr.post("http://127.0.0.1:9", "/v1/node/key", {}, timeout=1)
+        self.assertIsNone(cm.exception.status)
+
+
+
+class ParseGatewaysTests(unittest.TestCase):
+    def test_cleans_the_list(self):
+        text = """
+        # comment
+        https://llm.metabolomics.us/
+        https://a.example/v1 , https://llm.metabolomics.us
+
+        https://b.example:8080//
+        """
+        self.assertEqual(fr.parse_gateways(text),
+                         ["https://llm.metabolomics.us", "https://a.example", "https://b.example:8080"])
+
+    def test_empty_is_empty(self):
+        self.assertEqual(fr.parse_gateways(""), [])
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.key = os.path.join(self.tmp.name, "node-key")
+        fr.ensure_key(self.key)
+        self.gw = MockGateway()
+        self.lines = []
+        self.report = fr.collect(*fake_env())
+
+    def tearDown(self):
+        self.gw.stop()
+        self.tmp.cleanup()
+
+    def worker(self, url=None):
+        return fr.Worker(url or self.gw.url, self.key, self.tmp.name,
+                         lambda: self.report, self.lines.append)
+
+    def test_first_step_enrolls_and_registers_then_heartbeats(self):
+        w = self.worker()
+        w.step()
+        self.assertTrue(w.registered)
+        self.assertEqual(len(self.gw.registered), 1)
+        w.step()
+        self.assertEqual(len(self.gw.registered), 1, "unchanged hardware is not re-registered")
+        self.assertEqual(len(self.gw.heartbeats), 1)
+        self.assertTrue(any(l.startswith("OK:") for l in self.lines))
+
+    def test_changed_hardware_re_registers(self):
+        w = self.worker()
+        w.step()
+        self.report = dict(self.report, memBytes=self.report["memBytes"] + 1)
+        w.step()
+        self.assertEqual(len(self.gw.registered), 2)
+
+    def test_credential_is_reused_across_restarts(self):
+        self.worker().step()
+        self.gw.calls.clear()
+        self.worker().step()
+        self.assertNotIn("/v1/node/key", [p for p, _ in self.gw.calls])
+
+    def test_rejected_credential_re_enrolls(self):
+        w = self.worker()
+        w.step()
+        self.gw.creds.clear()  # gateway forgot us
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register -> 401, credential dropped
+        w.step()           # re-enroll + register
+        self.assertTrue(w.registered)
+        self.assertEqual(len(self.gw.registered), 2)
+
+    def test_unknown_connection_re_registers_with_the_same_credential(self):
+        w = self.worker()
+        w.step()
+        cred = w.credential
+        w.connection_id = "gone"
+        self.gw.calls.clear()
+        w.step()           # heartbeat 401 (Rust answers 401, not 404) -> unregistered, credential kept
+        w.step()
+        self.assertEqual(len(self.gw.registered), 2)
+        self.assertEqual(w.credential, cred)
+        self.assertNotIn("/v1/node/key", [p for p, _ in self.gw.calls], "no re-proof: Rust refuses a second one")
+
+    def test_dropped_credential_is_set_aside_not_deleted(self):
+        w = self.worker()
+        w.step()
+        self.gw.creds.clear()
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register 401 on a credential loaded earlier -> set aside
+        self.assertIsNone(w.credential)
+        self.assertTrue(os.path.exists(w.state_path + ".old"))
+
+    def test_refused_re_proof_is_logged_and_does_not_spin(self):
+        w = self.worker()
+        w.step()
+        # the gateway still binds a credential to this node, but ours is no longer valid
+        self.gw.creds = {"someone-elses-secret": w.node_id}
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register 401 -> credential set aside
+        wait = w.step()    # re-proof refused (already_enrolled)
+        self.assertFalse(w.registered)
+        self.assertTrue(any("already_enrolled" in l for l in self.lines), self.lines)
+        self.assertGreaterEqual(wait, 5)
+
+    def test_gateway_error_code_reaches_the_log(self):
+        self.gw.reject_register = True
+        w = self.worker()
+        w.step()
+        self.assertTrue(any("bad_request" in l and "deployment id" in l for l in self.lines), self.lines)
+
+    def test_state_file_is_written_atomically(self):
+        w = self.worker()
+        w.step()
+        names = os.listdir(os.path.dirname(w.state_path))
+        self.assertEqual([n for n in names if ".tmp" in n], [])
+        self.assertEqual(stat.S_IMODE(os.stat(w.state_path).st_mode), 0o600)
+
+    def test_failure_backs_off_and_logs_failed(self):
+        self.gw.fail_status = 503
+        w = self.worker()
+        first = w.step()
+        second = w.step()
+        self.assertFalse(w.registered)
+        self.assertGreater(second, first)
+        self.assertLessEqual(second, 300)
+        self.assertTrue(any(l.startswith("FAILED:") for l in self.lines))
+
+    def test_one_dead_gateway_does_not_block_another(self):
+        dead = self.worker("http://127.0.0.1:9")
+        live = self.worker()
+        dead.step()
+        live.step()
+        self.assertFalse(dead.registered)
+        self.assertTrue(live.registered)
+
+
+HOSTILE = [b"[]", b"null", b"not json", b'"str"',
+           b'{"challengeId": 5, "nonce": 1, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": "x", "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": -1, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": 18446744073709551616, "claim": {"role": "node"}}',
+           b'{"challengeId": "c", "nonce": 1, "claim": {"role": null}}',
+           b'{"challengeId": "c", "nonce": 1, "claim": []}',
+           b'{"credential": 7}']
+
+
+class HostileGatewayTests(unittest.TestCase):
+    def test_malformed_200s_never_escape_step(self):
+        gw = MockGateway()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                key = os.path.join(d, "node-key")
+                fr.ensure_key(key)
+                lines = []
+                for body in HOSTILE:
+                    gw.raw_override = (200, body)
+                    w = fr.Worker(gw.url, key, d, lambda: fr.collect(*fake_env()), lines.append)
+                    wait = w.step()
+                    self.assertIsInstance(wait, float, body)
+                    self.assertFalse(w.registered, body)
+                self.assertGreaterEqual(len([l for l in lines if l.startswith("FAILED:")]), len(HOSTILE))
+        finally:
+            gw.stop()
+
+    def test_bad_registration_response_is_a_failure_not_a_crash(self):
+        gw = MockGateway()
+        try:
+            with tempfile.TemporaryDirectory() as d:
+                key = os.path.join(d, "node-key")
+                fr.ensure_key(key)
+                w = fr.Worker(gw.url, key, d, lambda: fr.collect(*fake_env()), lambda l: None)
+                w.step()  # enrolled + registered
+                gw.raw_override = (200, b'{"connectionId": "c", "freshnessTtlSecs": null}')
+                w.registered = False
+                self.assertIsInstance(w.step(), float)
+        finally:
+            gw.stop()
+
+
+class KeyFileTests(unittest.TestCase):
+    def test_ensure_key_leaves_no_temp_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            fr.ensure_key(os.path.join(d, "node-key"))
+            self.assertEqual(os.listdir(d), ["node-key"])
+
+    def test_corrupt_key_is_logged_and_never_replaced(self):
+        with tempfile.TemporaryDirectory() as d:
+            gfile = os.path.join(d, "gw.list")
+            with open(gfile, "w") as f:
+                f.write("http://127.0.0.1:9\n")
+            key = os.path.join(d, "node-key")
+            open(key, "w").close()  # a 0-byte key, e.g. after a power cut
+            log = os.path.join(d, "log")
+            rc = fr.main(["--gateways-file", gfile, "--state-dir", d, "--log-file", log, "--once"])
+            self.assertEqual(rc, 2)
+            self.assertEqual(os.path.getsize(key), 0, "an unreadable key must not be silently replaced")
+            text = open(log).read()
+            self.assertIn("FAILED", text)
+            self.assertIn(key, text)
+
+
+class ReportCacheTests(unittest.TestCase):
+    def test_refresh_does_not_block_readers(self):
+        import time as _t
+        gate = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            if len(calls) > 1:
+                gate.wait(5)
+            return {"version": 1, "n": len(calls)}
+
+        cache = fr.ReportCache(slow, ttl=0.0)
+        first = cache.get()
+        started = _t.monotonic()
+        second = cache.get()        # stale -> refresh runs in the background
+        self.assertLess(_t.monotonic() - started, 1.0, "reader must not wait for the scan")
+        self.assertEqual(second, first)
+        gate.set()
+
+
+class CliTests(unittest.TestCase):
+    def test_once_registers_with_two_gateways_one_down(self):
+        gw = MockGateway()
+        with tempfile.TemporaryDirectory() as d:
+            gfile = os.path.join(d, "gateways")
+            open(gfile, "w").write(f"{gw.url}\nhttp://127.0.0.1:9\n")
+            rc = fr.main(["--gateways-file", gfile, "--state-dir", d,
+                          "--log-file", os.path.join(d, "log"), "--once"])
+            self.assertEqual(rc, 1, "one gateway is down, so not all registered")
+            self.assertEqual(len(gw.registered), 1)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, "node-key")).st_mode), 0o600)
+            self.assertIn("OK: registered", open(os.path.join(d, "log")).read())
+        gw.stop()
+
+
+if __name__ == "__main__":
+    unittest.main()

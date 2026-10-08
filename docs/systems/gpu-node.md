@@ -31,6 +31,26 @@ against. That first boot also runs a **GPU acceptance check** (visible cards,
 no uncorrectable ECC) and logs OK/FAILED to `/var/log/fiehnlab-provision.log`,
 so a dead or degraded card is caught at provisioning rather than mid-job.
 
+### Registers with InferWeave gateways
+
+On first boot the node enrolls itself with every gateway listed in
+`/etc/fiehnlab/gateways` (default `https://llm.metabolomics.us`) and advertises
+the hardware it found: GPUs (model, VRAM, driver, PCI id), CPU, RAM, disks and
+NICs. It registers with **each** gateway independently, so one being down never
+delays another. No code, token or secret is baked into the image.
+
+| | |
+|---|---|
+| Service | `fiehnlab-register.service` (`journalctl -u fiehnlab-register`) |
+| Identity | Ed25519 key in `/var/lib/fiehnlab/node-key` (root, 0600); node id is `node_` + 16 hex of its hash. Keep it: a new key is a new node. |
+| Gateways | `/etc/fiehnlab/gateways`, comma or newline separated. Edit, then `systemctl restart fiehnlab-register`. Set at build time with `NODE_GATEWAYS` (see `stick/README.md`). |
+| Protocol | The InferWeave node protocol: tokenless proof enrollment (`/v1/node/key`, `/challenge`, `/proof`), then `/v1/node/register` and `/heartbeat`. Any conforming gateway works. |
+| Re-registration | Automatic when the hardware report changes (new GPU, more RAM) and after a gateway restart or credential loss. |
+| Log | `OK:` / `FAILED:` lines in `/var/log/fiehnlab-provision.log` |
+
+A registered node serves nothing and receives no traffic. Which images to pull
+and which profile to run is decided later by the gateway.
+
 **Headless by design.** The base is `ubuntu-server-minimal` — no desktop, no
 display manager. `cuda-drivers` brings in the X *driver library* but nothing
 ever starts an X server, so no VRAM is handed to a display; at idle `nvidia-smi`

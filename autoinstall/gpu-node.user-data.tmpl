@@ -498,6 +498,28 @@ autoinstall:
           ExecStart=/usr/local/sbin/fiehnlab-gpu-container-setup.sh
           [Install]
           WantedBy=multi-user.target
+      - path: /usr/local/sbin/fiehnlab-register
+        permissions: "0755"
+        encoding: b64
+        content: @@REGISTER_AGENT_B64@@
+      - path: /etc/fiehnlab/gateways
+        permissions: "0644"
+        content: |
+          # InferWeave gateways this node registers with (comma or newline separated).
+          # Edit, then: systemctl restart fiehnlab-register
+          @@NODE_GATEWAYS@@
+      - path: /etc/systemd/system/fiehnlab-register.service
+        content: |
+          [Unit]
+          Description=Register this node and its hardware with InferWeave gateways
+          After=network-online.target
+          Wants=network-online.target
+          [Service]
+          ExecStart=/usr/local/sbin/fiehnlab-register
+          Restart=always
+          RestartSec=30
+          [Install]
+          WantedBy=multi-user.target
       - path: /etc/systemd/system/nvidia_gpu_exporter.service
         content: |
           [Unit]
@@ -512,6 +534,7 @@ autoinstall:
     runcmd:
       - [ bash, /usr/local/sbin/fiehnlab-harden.sh ]
       - [ systemctl, enable, fiehnlab-gpu-container.service ]
+      - [ systemctl, enable, --now, --no-block, fiehnlab-register.service ]
 
   # Reboot into the installed system when done
   shutdown: reboot

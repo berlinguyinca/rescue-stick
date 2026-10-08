@@ -7,3 +7,5 @@ fiehnlab-stick/
 stick-secrets.env
 **/work/
 **/out/
+__pycache__/
+*.pyc

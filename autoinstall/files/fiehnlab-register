@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+"""fiehnlab-register: enroll this node with InferWeave gateways and advertise its hardware.
+
+Speaks the inferweave/inferweave node protocol: /v1/node/{key,challenge,proof}
+(tokenless proof enrollment), /v1/node/register and /v1/node/heartbeat.
+Stdlib only; Ed25519 goes through openssl.
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.request
+
+PROOF_DOMAIN = b"iw-proof-enrollment-v1"
+ROLE = "node"
+
+# ---------------------------------------------------------------- crypto
+
+
+def _field(data):
+    return struct.pack(">I", len(data)) + data
+
+
+def _optional(value):
+    if value is None:
+        return b"\x00"
+    return b"\x01" + _field(value.encode())
+
+
+def proof_transcript(challenge_id, nonce, claim):
+    """The exact bytes a proof signs (iw_core::signature::proof_transcript)."""
+    out = _field(PROOF_DOMAIN) + _field(challenge_id.encode())
+    out += struct.pack(">Q", nonce)
+    out += _field(claim["role"].encode())
+    out += _optional(claim.get("model"))
+    out += _optional(claim.get("contextClass"))
+    out += _optional(claim.get("resourceClaim"))
+    return out
+
+
+def _openssl(args, data=None):
+    r = subprocess.run(["openssl"] + args, input=data, capture_output=True, check=True)
+    return r.stdout
+
+
+def ensure_key(path):
+    if os.path.exists(path):
+        return
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    old = os.umask(0o077)
+    try:
+        _openssl(["genpkey", "-algorithm", "ed25519", "-out", tmp])
+        os.chmod(tmp, 0o600)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    finally:
+        os.umask(old)
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def public_hex(path):
+    der = _openssl(["pkey", "-in", path, "-pubout", "-outform", "DER"])
+    return der[-32:].hex()
+
+
+def node_id_for(pub_hex):
+    return "node_" + hashlib.sha256(bytes.fromhex(pub_hex)).hexdigest()[:16]
+
+
+def sign_hex(path, message):
+    with tempfile.NamedTemporaryFile() as f:
+        f.write(message)
+        f.flush()
+        sig = _openssl(["pkeyutl", "-sign", "-inkey", path, "-rawin", "-in", f.name])
+    return sig.hex()
+
+
+# ------------------------------------------------------------- collector
+
+VENDORS = {"10de": "nvidia", "1002": "amd"}
+LSPCI_GPU = re.compile(
+    r"^(\S+) (?:VGA compatible controller|3D controller|Display controller) \[[0-9a-f]{4}\]: "
+    r"(.*) \[([0-9a-f]{4}):[0-9a-f]{4}\]")
+NVIDIA_QUERY = "index,uuid,name,memory.total,driver_version,pci.bus_id"
+SKIP_DISK = ("loop", "ram", "zram", "sr", "fd", "dm-", "md")
+SKIP_NIC = ("lo", "docker", "veth", "br-", "virbr", "tailscale", "podman", "cni", "flannel", "cali")
+
+
+def default_run(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def default_read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def default_listdir(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def parse_nvidia_smi(text):
+    gpus = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            continue
+        try:
+            index = int(parts[0])
+            vram = int(float(parts[3])) * 1024 * 1024
+        except ValueError:
+            continue
+        gpus.append({"vendor": "nvidia", "index": index, "uuid": parts[1], "model": parts[2],
+                     "vramBytes": vram, "driver": parts[4], "pciId": parts[5]})
+    return gpus
+
+
+def parse_lspci_gpus(text):
+    gpus = []
+    for line in (text or "").splitlines():
+        m = LSPCI_GPU.match(line)
+        if not m:
+            continue
+        slot, desc, vendor_id = m.groups()
+        gpus.append({"vendor": VENDORS.get(vendor_id, "other"), "index": len(gpus), "uuid": "",
+                     "model": desc, "vramBytes": 0, "driver": "", "pciId": slot})
+    return gpus
+
+
+def _int(text, default=0):
+    try:
+        return int((text or "").strip())
+    except ValueError:
+        return default
+
+
+def _gpus(run, read, notes):
+    smi = parse_nvidia_smi(run(["nvidia-smi", f"--query-gpu={NVIDIA_QUERY}", "--format=csv,noheader,nounits"]))
+    seen = parse_lspci_gpus(run(["lspci", "-nn"]))
+    gpus = list(smi)
+    if not smi:
+        gpus += [g for g in seen if g["vendor"] == "nvidia"]
+        if any(g["vendor"] == "nvidia" for g in gpus):
+            notes.append("NVIDIA card present but nvidia-smi gave nothing: driver not loaded yet")
+    for g in seen:
+        if g["vendor"] == "amd":
+            g["vramBytes"] = _int(read(f"/sys/bus/pci/devices/0000:{g['pciId']}/mem_info_vram_total"))
+            gpus.append(g)
+    for i, g in enumerate(gpus):
+        g["index"] = i
+    if not gpus:
+        notes.append("no GPU found")
+    return gpus
+
+
+def _disks(read, listdir):
+    out = []
+    for name in listdir("/sys/block"):
+        if name.startswith(SKIP_DISK):
+            continue
+        sectors = _int(read(f"/sys/block/{name}/size"))
+        if not sectors:
+            continue
+        out.append({"name": name, "sizeBytes": sectors * 512,
+                    "rotational": _int(read(f"/sys/block/{name}/queue/rotational")) == 1})
+    return out
+
+
+def _nics(read, listdir):
+    out = []
+    for name in listdir("/sys/class/net"):
+        if name.startswith(SKIP_NIC):
+            continue
+        speed = _int(read(f"/sys/class/net/{name}/speed"), -1)
+        out.append({"name": name, "speedMbps": speed if speed > 0 else None})
+    return out
+
+
+def collect(run=default_run, read=default_read, listdir=default_listdir):
+    notes = []
+    cpuinfo = read("/proc/cpuinfo") or ""
+    models = re.findall(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+    mem = re.search(r"^MemTotal:\s+(\d+) kB", read("/proc/meminfo") or "", re.M)
+    osr = re.search(r'^PRETTY_NAME="?([^"\n]*)"?', read("/etc/os-release") or "", re.M)
+    return {
+        "version": 1,
+        "hostname": (read("/etc/hostname") or socket.gethostname()).strip(),
+        "machineId": (read("/etc/machine-id") or "").strip(),
+        "role": (read("/etc/fiehnlab/role") or "").strip(),
+        "kernel": (read("/proc/sys/kernel/osrelease") or "").strip(),
+        "os": osr.group(1) if osr else "",
+        "cpu": {"model": models[0] if models else "", "threads": len(models)},
+        "memBytes": int(mem.group(1)) * 1024 if mem else 0,
+        "disks": _disks(read, listdir),
+        "nics": _nics(read, listdir),
+        "gpus": _gpus(run, read, notes),
+        "notes": notes,
+    }
+
+
+def register_vram(report):
+    return sum(g["vramBytes"] for g in report["gpus"])
+
+
+# ---------------------------------------------------------------- client
+
+
+class GatewayError(Exception):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
+MAX_RESPONSE = 1 << 20
+
+
+def _error_detail(err):
+    """`error.code` and `error.message` from a gateway error body, truncated. Never the request."""
+    try:
+        e = json.loads(err.read(4096)).get("error", {})
+        code, msg = str(e.get("code", "")), str(e.get("message", ""))
+    except (ValueError, AttributeError, OSError):
+        return ""
+    return f" ({code}: {msg[:160]})" if code or msg else ""
+
+
+def post(base, path, body, timeout=15):
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data, method="POST",
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read(MAX_RESPONSE) or b"{}")
+    except urllib.error.HTTPError as e:
+        raise GatewayError(f"{path}: HTTP {e.code}{_error_detail(e)}", e.code) from e
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        raise GatewayError(f"{path}: {e}") from e
+
+
+def _object(value, what):
+    if not isinstance(value, dict):
+        raise GatewayError(f"{what}: response is not a JSON object")
+    return value
+
+
+def enroll(base, key_path):
+    pub = public_hex(key_path)
+    node_id = node_id_for(pub)
+    post(base, "/v1/node/key", {"nodeId": node_id, "publicKey": pub})
+    ch = _object(post(base, "/v1/node/challenge", {"nodeId": node_id, "role": ROLE}), "challenge")
+    cid, nonce, claim = ch.get("challengeId"), ch.get("nonce"), ch.get("claim")
+    if not isinstance(cid, str) or isinstance(nonce, bool) or not isinstance(nonce, int) \
+            or not 0 <= nonce < 1 << 64 or not isinstance(claim, dict) \
+            or not isinstance(claim.get("role"), str):
+        raise GatewayError("/v1/node/challenge: malformed challenge")
+    sig = sign_hex(key_path, proof_transcript(cid, nonce, claim))
+    proved = _object(post(base, "/v1/node/proof", {"nodeId": node_id, "challengeId": cid,
+                                                   "claim": claim, "signature": sig}), "proof")
+    if not isinstance(proved.get("credential"), str) or not proved["credential"]:
+        raise GatewayError("/v1/node/proof: no credential in response")
+    return proved
+
+
+def register_body(node_id, credential, report):
+    gpus = report["gpus"]
+    return {
+        "nodeId": node_id, "role": ROLE, "credential": credential,
+        "endpoint": "", "models": [], "deployment": "",
+        "vramBytes": register_vram(report), "kvBytes": 0, "kvBytesPerToken": 0,
+        "gpuIds": [f"gpu{g['index']}" for g in gpus],
+        "card": gpus[0]["model"] if gpus else None,
+        "capabilities": [], "hardware": report,
+    }
+
+
+def register(base, body):
+    resp = _object(post(base, "/v1/node/register", body), "register")
+    if not isinstance(resp.get("connectionId"), str) or not resp["connectionId"]:
+        raise GatewayError("/v1/node/register: no connectionId in response")
+    return resp
+
+
+def heartbeat(base, node_id, connection_id):
+    return post(base, "/v1/node/heartbeat", {
+        "nodeId": node_id, "connectionId": connection_id,
+        "status": {"busySlots": 0, "queueDepth": 0, "residentModels": [],
+                   "occupancyUnmeasured": True}})
+
+
+# ---------------------------------------------------------------- worker
+
+BACKOFF_START = 5.0
+BACKOFF_MAX = 300.0
+REPORT_TTL = 300.0
+
+
+def parse_gateways(text):
+    urls = []
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0]
+        for item in line.split(","):
+            url = item.strip().rstrip("/")
+            if url.endswith("/v1"):
+                url = url[:-3].rstrip("/")
+            if url and url not in urls:
+                urls.append(url)
+    return urls
+
+
+def _interval(ttl):
+    try:
+        return max(5.0, float(ttl) / 3)
+    except (TypeError, ValueError):
+        return 10.0
+
+
+def _report_hash(report):
+    return hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
+
+
+class Worker:
+    """One gateway. step() does the next useful thing and returns seconds to sleep."""
+
+    def __init__(self, url, key_path, state_dir, get_report, log):
+        self.url, self.key_path, self.log, self.get_report = url, key_path, log, get_report
+        d = os.path.join(state_dir, "gateway-state")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        self.state_path = os.path.join(d, hashlib.sha256(url.encode()).hexdigest()[:12] + ".json")
+        self.node_id = node_id_for(public_hex(key_path))
+        self.credential = self._load()
+        self.registered = False
+        self.connection_id = None
+        self.registered_hash = None
+        self.interval = 10.0
+        self.backoff = BACKOFF_START
+
+    def _load(self):
+        try:
+            with open(self.state_path) as f:
+                saved = json.load(f)
+            return saved["credential"] if saved.get("nodeId") == self.node_id else None
+        except (OSError, ValueError, KeyError):
+            return None
+
+    def _save(self):
+        tmp = self.state_path + ".tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"nodeId": self.node_id, "credential": self.credential}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, self.state_path)
+
+    def _set_credential_aside(self):
+        """Keep a rejected credential as <state>.old: it is revealed once and cannot be re-fetched."""
+        self.credential = None
+        self.registered = False
+        try:
+            os.replace(self.state_path, self.state_path + ".old")
+        except OSError:
+            pass
+
+    def step(self):
+        phase = "enroll"
+        fresh = False
+        try:
+            if not self.credential:
+                cred = enroll(self.url, self.key_path)
+                fresh = True
+                self.credential = cred["credential"]
+                self._save()
+                self.log(f"OK: enrolled {self.node_id} with {self.url}")
+            report = self.get_report()
+            digest = _report_hash(report)
+            if not self.registered or digest != self.registered_hash:
+                phase = "register"
+                resp = register(self.url, register_body(self.node_id, self.credential, report))
+                self.connection_id = resp["connectionId"]
+                self.interval = _interval(resp.get("freshnessTtlSecs"))
+                self.registered, self.registered_hash = True, digest
+                self.log(f"OK: registered {self.node_id} with {self.url}"
+                         f" ({len(report['gpus'])} GPU(s))")
+            else:
+                phase = "heartbeat"
+                heartbeat(self.url, self.node_id, self.connection_id)
+            self.backoff = BACKOFF_START
+            return self.interval
+        except GatewayError as e:
+            if phase == "heartbeat":
+                # Rust answers 401 for a superseded or unknown connection. The credential is
+                # fine; register again with it (a second proof would be refused).
+                self.registered = False
+            elif phase == "register" and e.status in (401, 403) and not fresh:
+                self._set_credential_aside()
+            self.log(f"FAILED: {self.url}: {e}")
+        except Exception as e:  # a hostile or buggy gateway must never end this worker
+            self.log(f"FAILED: {self.url}: unexpected {type(e).__name__}: {e}")
+        wait = self.backoff
+        self.backoff = min(self.backoff * 2, BACKOFF_MAX)
+        return wait
+
+
+# ------------------------------------------------------------------ main
+
+
+def make_logger(path):
+    lock = threading.Lock()
+
+    def log(line):
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        text = f"{stamp} fiehnlab-register {line}"
+        with lock:
+            print(text, flush=True)
+            try:
+                with open(path, "a") as f:
+                    f.write(text + "\n")
+            except OSError:
+                pass
+
+    return log
+
+
+class ReportCache:
+    """Serves the last hardware report; refreshes in the background so a stuck tool cannot stall heartbeats."""
+
+    def __init__(self, collector=None, ttl=REPORT_TTL):
+        self.collector = collector or collect
+        self.ttl = ttl
+        self.lock = threading.Lock()
+        self.ready = threading.Event()
+        self.value, self.at, self.refreshing = None, 0.0, False
+
+    def _refresh(self):
+        try:
+            value = self.collector()
+            with self.lock:
+                self.value, self.at = value, time.monotonic()
+            self.ready.set()
+        finally:
+            with self.lock:
+                self.refreshing = False
+
+    def get(self):
+        with self.lock:
+            stale = self.value is None or time.monotonic() - self.at >= self.ttl
+            start = stale and not self.refreshing
+            if start:
+                self.refreshing = True
+            have = self.value
+        if have is None:
+            if start:
+                self._refresh()
+            elif not self.ready.wait(120):
+                raise RuntimeError("hardware scan is still running")
+            return self.value
+        if start:
+            threading.Thread(target=self._refresh, daemon=True).start()
+        return have
+
+
+def run_worker(worker, stop):
+    while not stop.is_set():
+        stop.wait(worker.step())
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--gateways-file", default="/etc/fiehnlab/gateways")
+    ap.add_argument("--state-dir", default="/var/lib/fiehnlab")
+    ap.add_argument("--log-file", default="/var/log/fiehnlab-provision.log")
+    ap.add_argument("--once", action="store_true",
+                    help="one pass over every gateway, exit 0 only if all registered")
+    args = ap.parse_args(argv)
+    log = make_logger(args.log_file)
+
+    try:
+        with open(args.gateways_file) as f:
+            urls = parse_gateways(f.read())
+    except OSError as e:
+        log(f"FAILED: cannot read {args.gateways_file}: {e}")
+        return 2
+    if not urls:
+        log(f"FAILED: no gateways listed in {args.gateways_file}")
+        return 2
+
+    key_path = os.path.join(args.state_dir, "node-key")
+    existed = os.path.exists(key_path)
+    try:
+        ensure_key(key_path)
+        identity = node_id_for(public_hex(key_path))
+    except (OSError, subprocess.SubprocessError) as e:
+        log(f"FAILED: identity key {key_path} is unusable ({type(e).__name__}); "
+            f"not replacing it. Fix or remove it deliberately: a new key is a new node")
+        return 2
+    log(f"{'using existing' if existed else 'generated new'} identity {identity}")
+
+    cache = ReportCache()
+    workers = [Worker(u, key_path, args.state_dir, cache.get, log) for u in urls]
+    if args.once:
+        for w in workers:
+            w.step()
+        return 0 if all(w.registered for w in workers) else 1
+
+    stop = threading.Event()
+    threads = [threading.Thread(target=run_worker, args=(w, stop), daemon=True) for w in workers]
+    for t in threads:
+        t.start()
+    try:
+        for t in threads:
+            t.join()
+    except KeyboardInterrupt:
+        stop.set()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
