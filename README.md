@@ -8,9 +8,9 @@ Plug it in, pick an entry from the boot menu:
 
 | Entry | What it does |
 |-------|--------------|
-| **gpu-node** | Unattended Ubuntu Server install — hardened, latest NVIDIA/ROCm drivers |
-| **desktop** | Unattended Ubuntu Desktop install — hardened |
-| **rescue-os** | Live desktop that boots straight into an AI rescue assistant (offline local model + optional online gateway), with networking, forensics and reverse-engineering tools ready to go |
+| [**gpu-node**](docs/systems/gpu-node.md) | Unattended Ubuntu Server install — hardened, latest NVIDIA/ROCm drivers |
+| [**desktop**](docs/systems/desktop.md) | Unattended Ubuntu Desktop install — hardened |
+| [**rescue-os**](docs/systems/rescue-os.md) | Live desktop that boots straight into an AI rescue assistant (offline local model + optional online gateway), with networking, forensics and reverse-engineering tools ready to go |
 | **Rocky** | Rocky Linux installers |
 
 The rescue assistant is powered by [berlinguyinca/pi-rescue](https://github.com/berlinguyinca/pi-rescue).
