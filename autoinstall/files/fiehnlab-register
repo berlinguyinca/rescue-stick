@@ -79,3 +79,140 @@ def sign_hex(path, message):
         f.flush()
         sig = _openssl(["pkeyutl", "-sign", "-inkey", path, "-rawin", "-in", f.name])
     return sig.hex()
+
+
+# ------------------------------------------------------------- collector
+
+VENDORS = {"10de": "nvidia", "1002": "amd"}
+LSPCI_GPU = re.compile(
+    r"^(\S+) (?:VGA compatible controller|3D controller|Display controller) \[[0-9a-f]{4}\]: "
+    r"(.*) \[([0-9a-f]{4}):[0-9a-f]{4}\]")
+NVIDIA_QUERY = "index,uuid,name,memory.total,driver_version,pci.bus_id"
+SKIP_DISK = ("loop", "ram", "zram", "sr", "fd", "dm-", "md")
+SKIP_NIC = ("lo", "docker", "veth", "br-", "virbr", "tailscale")
+
+
+def default_run(cmd):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+def default_read(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def default_listdir(path):
+    try:
+        return sorted(os.listdir(path))
+    except OSError:
+        return []
+
+
+def parse_nvidia_smi(text):
+    gpus = []
+    for line in (text or "").splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 6:
+            continue
+        try:
+            index = int(parts[0])
+            vram = int(float(parts[3])) * 1024 * 1024
+        except ValueError:
+            continue
+        gpus.append({"vendor": "nvidia", "index": index, "uuid": parts[1], "model": parts[2],
+                     "vramBytes": vram, "driver": parts[4], "pciId": parts[5]})
+    return gpus
+
+
+def parse_lspci_gpus(text):
+    gpus = []
+    for line in (text or "").splitlines():
+        m = LSPCI_GPU.match(line)
+        if not m:
+            continue
+        slot, desc, vendor_id = m.groups()
+        gpus.append({"vendor": VENDORS.get(vendor_id, "other"), "index": len(gpus), "uuid": "",
+                     "model": desc, "vramBytes": 0, "driver": "", "pciId": slot})
+    return gpus
+
+
+def _int(text, default=0):
+    try:
+        return int((text or "").strip())
+    except ValueError:
+        return default
+
+
+def _gpus(run, read, notes):
+    smi = parse_nvidia_smi(run(["nvidia-smi", f"--query-gpu={NVIDIA_QUERY}", "--format=csv,noheader,nounits"]))
+    seen = parse_lspci_gpus(run(["lspci", "-nn"]))
+    gpus = list(smi)
+    if not smi:
+        gpus += [g for g in seen if g["vendor"] == "nvidia"]
+        if any(g["vendor"] == "nvidia" for g in gpus):
+            notes.append("NVIDIA card present but nvidia-smi gave nothing: driver not loaded yet")
+    for g in seen:
+        if g["vendor"] == "amd":
+            g["vramBytes"] = _int(read(f"/sys/bus/pci/devices/0000:{g['pciId']}/mem_info_vram_total"))
+            gpus.append(g)
+    for i, g in enumerate(gpus):
+        g["index"] = i
+    if not gpus:
+        notes.append("no GPU found")
+    return gpus
+
+
+def _disks(read, listdir):
+    out = []
+    for name in listdir("/sys/block"):
+        if name.startswith(SKIP_DISK):
+            continue
+        sectors = _int(read(f"/sys/block/{name}/size"))
+        if not sectors:
+            continue
+        out.append({"name": name, "sizeBytes": sectors * 512,
+                    "rotational": _int(read(f"/sys/block/{name}/queue/rotational")) == 1})
+    return out
+
+
+def _nics(read, listdir):
+    out = []
+    for name in listdir("/sys/class/net"):
+        if name.startswith(SKIP_NIC):
+            continue
+        speed = _int(read(f"/sys/class/net/{name}/speed"), -1)
+        out.append({"name": name, "speedMbps": speed if speed > 0 else None})
+    return out
+
+
+def collect(run=default_run, read=default_read, listdir=default_listdir):
+    notes = []
+    cpuinfo = read("/proc/cpuinfo") or ""
+    models = re.findall(r"^model name\s*:\s*(.+)$", cpuinfo, re.M)
+    mem = re.search(r"^MemTotal:\s+(\d+) kB", read("/proc/meminfo") or "", re.M)
+    osr = re.search(r'^PRETTY_NAME="?([^"\n]*)"?', read("/etc/os-release") or "", re.M)
+    return {
+        "version": 1,
+        "hostname": (read("/etc/hostname") or socket.gethostname()).strip(),
+        "machineId": (read("/etc/machine-id") or "").strip(),
+        "role": (read("/etc/fiehnlab/role") or "").strip(),
+        "kernel": (read("/proc/sys/kernel/osrelease") or "").strip(),
+        "os": osr.group(1) if osr else "",
+        "cpu": {"model": models[0] if models else "", "threads": len(models)},
+        "memBytes": int(mem.group(1)) * 1024 if mem else 0,
+        "disks": _disks(read, listdir),
+        "nics": _nics(read, listdir),
+        "gpus": _gpus(run, read, notes),
+        "notes": notes,
+    }
+
+
+def register_vram(report):
+    return sum(g["vramBytes"] for g in report["gpus"])
