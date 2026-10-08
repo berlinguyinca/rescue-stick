@@ -214,6 +214,7 @@ class MockGateway:
 
     def stop(self):
         self.server.shutdown()
+        self.server.server_close()
 
     def handle(self, path, b):
         if path == "/v1/node/key":
@@ -292,6 +293,115 @@ class ClientTests(unittest.TestCase):
         with self.assertRaises(fr.GatewayError) as cm:
             fr.post("http://127.0.0.1:9", "/v1/node/key", {}, timeout=1)
         self.assertIsNone(cm.exception.status)
+
+
+
+class ParseGatewaysTests(unittest.TestCase):
+    def test_cleans_the_list(self):
+        text = """
+        # comment
+        https://llm.metabolomics.us/
+        https://a.example/v1 , https://llm.metabolomics.us
+
+        https://b.example:8080//
+        """
+        self.assertEqual(fr.parse_gateways(text),
+                         ["https://llm.metabolomics.us", "https://a.example", "https://b.example:8080"])
+
+    def test_empty_is_empty(self):
+        self.assertEqual(fr.parse_gateways(""), [])
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.key = os.path.join(self.tmp.name, "node-key")
+        fr.ensure_key(self.key)
+        self.gw = MockGateway()
+        self.lines = []
+        self.report = fr.collect(*fake_env())
+
+    def tearDown(self):
+        self.gw.stop()
+        self.tmp.cleanup()
+
+    def worker(self, url=None):
+        return fr.Worker(url or self.gw.url, self.key, self.tmp.name,
+                         lambda: self.report, self.lines.append)
+
+    def test_first_step_enrolls_and_registers_then_heartbeats(self):
+        w = self.worker()
+        w.step()
+        self.assertTrue(w.registered)
+        self.assertEqual(len(self.gw.registered), 1)
+        w.step()
+        self.assertEqual(len(self.gw.registered), 1, "unchanged hardware is not re-registered")
+        self.assertEqual(len(self.gw.heartbeats), 1)
+        self.assertTrue(any(l.startswith("OK:") for l in self.lines))
+
+    def test_changed_hardware_re_registers(self):
+        w = self.worker()
+        w.step()
+        self.report = dict(self.report, memBytes=self.report["memBytes"] + 1)
+        w.step()
+        self.assertEqual(len(self.gw.registered), 2)
+
+    def test_credential_is_reused_across_restarts(self):
+        self.worker().step()
+        self.gw.calls.clear()
+        self.worker().step()
+        self.assertNotIn("/v1/node/key", [p for p, _ in self.gw.calls])
+
+    def test_rejected_credential_re_enrolls(self):
+        w = self.worker()
+        w.step()
+        self.gw.creds.clear()  # gateway forgot us
+        self.report = dict(self.report, memBytes=1)
+        w.step()           # register -> 401, credential dropped
+        w.step()           # re-enroll + register
+        self.assertTrue(w.registered)
+        self.assertEqual(len(self.gw.registered), 2)
+
+    def test_unknown_connection_re_registers(self):
+        w = self.worker()
+        w.step()
+        w.connection_id = "gone"
+        w.step()           # heartbeat 404 -> mark unregistered
+        w.step()
+        self.assertEqual(len(self.gw.registered), 2)
+
+    def test_failure_backs_off_and_logs_failed(self):
+        self.gw.fail_status = 503
+        w = self.worker()
+        first = w.step()
+        second = w.step()
+        self.assertFalse(w.registered)
+        self.assertGreater(second, first)
+        self.assertLessEqual(second, 300)
+        self.assertTrue(any(l.startswith("FAILED:") for l in self.lines))
+
+    def test_one_dead_gateway_does_not_block_another(self):
+        dead = self.worker("http://127.0.0.1:9")
+        live = self.worker()
+        dead.step()
+        live.step()
+        self.assertFalse(dead.registered)
+        self.assertTrue(live.registered)
+
+
+class CliTests(unittest.TestCase):
+    def test_once_registers_with_two_gateways_one_down(self):
+        gw = MockGateway()
+        with tempfile.TemporaryDirectory() as d:
+            gfile = os.path.join(d, "gateways")
+            open(gfile, "w").write(f"{gw.url}\nhttp://127.0.0.1:9\n")
+            rc = fr.main(["--gateways-file", gfile, "--state-dir", d,
+                          "--log-file", os.path.join(d, "log"), "--once"])
+            self.assertEqual(rc, 1, "one gateway is down, so not all registered")
+            self.assertEqual(len(gw.registered), 1)
+            self.assertEqual(stat.S_IMODE(os.stat(os.path.join(d, "node-key")).st_mode), 0o600)
+            self.assertIn("OK: registered", open(os.path.join(d, "log")).read())
+        gw.stop()
 
 
 if __name__ == "__main__":

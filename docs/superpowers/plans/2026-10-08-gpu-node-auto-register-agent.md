@@ -770,7 +770,7 @@ git commit -m "feat(register): tokenless enrollment, register and heartbeat clie
   - `parse_gateways(text: str) -> list[str]`
   - `class Worker(url, key_path, state_dir, get_report, log, clock=time.monotonic)` with `step() -> float` (seconds to sleep) and attributes `registered: bool`
   - `main(argv=None) -> int`
-- State file: `<state_dir>/gateways/<sha256(url)[:12]>.json` = `{"credential","nodeId"}`, mode 0600.
+- State file: `<state_dir>/gateway-state/<sha256(url)[:12]>.json` = `{"credential","nodeId"}`, mode 0600.
 
 - [ ] **Step 1: Write the failing tests**
 
