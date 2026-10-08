@@ -85,6 +85,13 @@ cmd_fetch(){
     [ -s "$dest" ] && { log "have ${iso}"; continue; }
     case "$src" in
       url:*)   log "downloading ${iso} ..."; curl -fL "${src#url:}" -o "$dest.part" && mv "$dest.part" "$dest" ;;
+      zip:*)   log "downloading + extracting ${iso} ..."; \
+               command -v unzip >/dev/null || die "unzip not installed (needed for zip: sources: apt install unzip)"; \
+               local tmp; tmp="$(mktemp -d)"; \
+               curl -fL "${src#zip:}" -o "$tmp/dl.zip" || { rm -rf "$tmp"; die "${iso}: download failed"; }; \
+               local inner; inner="$(unzip -Z1 "$tmp/dl.zip" '*.iso' 2>/dev/null | head -1)"; \
+               [ -n "$inner" ] || { rm -rf "$tmp"; die "${iso}: no .iso found inside the downloaded zip"; }; \
+               unzip -p "$tmp/dl.zip" "$inner" > "$dest.part" && mv "$dest.part" "$dest"; rm -rf "$tmp" ;;
       file:*)  local p="${src#file:}"; [ -n "$p" ] || die "${iso}: source is file: but no path given (edit manifest)"; \
                log "copying ${iso} from $p"; cp -f "${p/#\~/$HOME}" "$dest" ;;
       built:*) die "${iso}: build it with ${src#built:} then place it at $dest (heavy build; not auto-run)" ;;

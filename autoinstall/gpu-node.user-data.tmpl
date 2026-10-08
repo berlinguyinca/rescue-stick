@@ -179,6 +179,8 @@ autoinstall:
     - curl
     - gnupg
     - pciutils
+    - smartmontools              # SMART disk health (smartctl) on long-running compute nodes
+    - nvme-cli                   # NVMe health + diagnostics (nvme smart-log)
     - htop
     - vim
     - prometheus-node-exporter   # host metrics on :9100 for the lab Prometheus/Grafana
@@ -458,6 +460,15 @@ autoinstall:
                 curl -fsSL "$U" | tar -xz -C /usr/local/bin nvidia_gpu_exporter >>"$L" 2>&1 && chmod 0755 /usr/local/bin/nvidia_gpu_exporter
               fi
               systemctl daemon-reload; systemctl enable --now nvidia_gpu_exporter.service >>"$L" 2>&1 && echo "OK: nvidia_gpu_exporter :9835" >>"$L" || echo "FAILED: nvidia_gpu_exporter" >>"$L"
+              # Keep the driver resident on this headless compute node: stable clocks/ECC,
+              # no per-job driver teardown, faster job start. cuda-drivers already installs
+              # nvidia-persistenced; just make sure it is enabled.
+              systemctl enable --now nvidia-persistenced >>"$L" 2>&1 && echo "OK: nvidia-persistenced (persistence mode)" >>"$L" || echo "WARN: nvidia-persistenced not enabled" >>"$L"
+              # First-boot GPU acceptance check: a dead/degraded card fails HERE (at
+              # provisioning) instead of silently mid-job. Pure nvidia-smi, no extra deps.
+              { echo "--- GPU acceptance $(date -Is) ---"; nvidia-smi --query-gpu=index,name,memory.total,memory.free,ecc.errors.uncorrected.aggregate.total,temperature.gpu --format=csv; } >>"$L" 2>&1
+              ECCU=$(nvidia-smi --query-gpu=ecc.errors.uncorrected.aggregate.total --format=csv,noheader,nounits 2>/dev/null | grep -viE 'N/A|^[[:space:]]*0[[:space:]]*$' | head -1)
+              if nvidia-smi -L >/dev/null 2>&1 && [ -z "$ECCU" ]; then echo "OK: GPU acceptance (all cards visible, no uncorrectable ECC)" >>"$L"; else echo "FAILED: GPU acceptance (card missing or uncorrectable ECC: ${ECCU:-none}) -- INSPECT THIS CARD" >>"$L"; fi
               touch "$M"
             else
               echo "WAIT: nvidia driver not ready; retry next boot" >>"$L"; exit 0
@@ -468,6 +479,9 @@ autoinstall:
             else
               echo "NOTE: AMD containers -> docker run --device=/dev/kfd --device=/dev/dri --group-add video,render ; apptainer run --rocm" >>"$L"
             fi
+            # First-boot GPU acceptance check (AMD): log what rocm-smi/rocminfo sees.
+            { echo "--- GPU acceptance $(date -Is) ---"; rocm-smi --showproductname --showmeminfo vram --showtemp 2>/dev/null || rocminfo 2>/dev/null | grep -iE 'Marketing|Name:'; } >>"$L" 2>&1
+            command -v rocminfo >/dev/null 2>&1 && rocminfo >/dev/null 2>&1 && echo "OK: GPU acceptance (ROCm sees the device)" >>"$L" || echo "WARN: GPU acceptance (ROCm not ready yet; review rocm-smi output above)" >>"$L"
             touch "$M"
           else
             echo "NOTE: no discrete GPU; skipping container-GPU setup" >>"$L"; touch "$M"

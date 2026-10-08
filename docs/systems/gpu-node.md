@@ -21,11 +21,20 @@ containers — no desktop, no manual tuning.
 | **AMD ROCm (`amdgpu-install`)** | Same idea for AMD cards, via Radeon's install script |
 | **Docker + Compose, nvidia-container-toolkit** | `docker run --gpus all` works out of the box once the driver lands; NVIDIA CDI is generated automatically |
 | **Apptainer** | `apptainer run --nv` / `--rocm` against the host driver |
+| **nvidia-persistenced** | Enabled on first boot so the driver stays resident — stable clocks/ECC, no per-job teardown, faster job start |
 | **[prometheus-node-exporter](https://github.com/prometheus/node_exporter)** (:9100) + **nvidia_gpu_exporter** (:9835) | Feeds the lab's Prometheus/Grafana |
+| **smartmontools + nvme-cli** | Disk/NVMe health on long-running nodes (`smartctl`, `nvme smart-log`) |
 
 Driver installation and the container GPU wiring both finish on the *first real
 boot* (not during install) — the installer environment has no GPU to test
-against.
+against. That first boot also runs a **GPU acceptance check** (visible cards,
+no uncorrectable ECC) and logs OK/FAILED to `/var/log/fiehnlab-provision.log`,
+so a dead or degraded card is caught at provisioning rather than mid-job.
+
+**Headless by design.** The base is `ubuntu-server-minimal` — no desktop, no
+display manager. `cuda-drivers` brings in the X *driver library* but nothing
+ever starts an X server, so no VRAM is handed to a display; at idle `nvidia-smi`
+shows no graphical process and ~0 MB used. All GPU memory is yours.
 
 ## Security / hardening
 

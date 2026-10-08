@@ -6,6 +6,7 @@
 #   iso       the ISO filename as it should appear on the stick (Ventoy shows these)
 #   source    where forge-stick.sh gets the ISO when it's missing from staging:
 #               url:<URL>          download it
+#               zip:<URL>          download a .zip and extract the first *.iso from it
 #               file:<path>        copy from a local path (built elsewhere)
 #               built:<builder>    produced by a repo builder (forge won't auto-run heavy builds;
 #                                  build it, drop the result in staging as <iso>)
@@ -22,3 +23,4 @@ rescue-os|rescue-os.iso|built:live-rescue/build-live.sh|-
 rocky-kvm-node|Rocky-9.8-ks-kvm-node-12.iso|file:|-
 rocky-kvm-recovery|Rocky-9.8-ks-kvm-node-12-recovery.iso|file:|-
 rocky-minimal|Rocky-9.8-x86_64-minimal.iso|url:https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9.8-x86_64-minimal.iso|-
+memtest86+|memtest86plus.iso|zip:https://memtest.org/download/v8.10/mt86plus_8.10_x86_64.iso.zip|-
