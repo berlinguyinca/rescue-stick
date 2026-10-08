@@ -1,59 +1,40 @@
 # rescue-stick
 
-Reproducibly build the **fiehnlab provisioning + rescue USB**: a single Ventoy
-multiboot stick that can unattended-install our systems, boot a full
-rescue/work environment, and carry our secrets encrypted — "plug it into any
-box and install it, rescue it, or start working."
+Build **one USB stick that can install, rescue, or work on almost any PC**. It's a
+[Ventoy](https://www.ventoy.net) multiboot stick holding several bootable systems
+plus an AI-assisted live rescue environment.
 
-Everything here is **tooling and templates only** — no ISOs, no keys, no
-passwords. Secrets live in an encrypted LUKS container on the stick and are
-loaded into RAM at boot; the password hash for autoinstall is injected at build
-time from an uncommitted source. See [`stick/README.md`](stick/README.md).
+Plug it in, pick an entry from the boot menu:
 
-## What's on the stick
+| Entry | What it does |
+|-------|--------------|
+| **gpu-node** | Unattended Ubuntu Server install — hardened, latest NVIDIA/ROCm drivers |
+| **desktop** | Unattended Ubuntu Desktop install — hardened |
+| **fiehnlab-live** | Live desktop that boots straight into an AI rescue assistant (offline local model + optional online gateway), with networking, forensics and reverse-engineering tools ready to go |
+| **Rocky** | Rocky Linux installers |
 
-| System | Built by | Boot behavior |
-|--------|----------|---------------|
-| **gpu-node** (Ubuntu Server autoinstall) | [`autoinstall/gpu-node.user-data.tmpl`](autoinstall) | Unattended install, hardened, latest NVIDIA/ROCm |
-| **desktop** (Ubuntu Desktop autoinstall) | [`autoinstall/desktop.user-data.tmpl`](autoinstall) | Unattended install, hardened |
-| **fiehnlab-live** (rescue + work) | [`live-rescue/build-live.sh`](live-rescue) | Live desktop that boots straight into an AI rescue assistant (local llama.cpp model + [pi-rescue](https://github.com/berlinguyinca/pi-rescue)), full RE/network/forensics toolset |
-| **Rocky** (kvm-node / recovery / minimal) | kickstarts built in `fsc-forge-tokens` (ISOs ship pre-baked) | Kickstart installs |
+The rescue assistant is powered by [berlinguyinca/pi-rescue](https://github.com/berlinguyinca/pi-rescue).
 
-## Components
-
-- **[`stick/`](stick)** — `forge-stick.sh` + `stick.manifest`: install Ventoy,
-  render autoinstall seeds, write `ventoy.json`, copy ISOs. Data-driven; adding a
-  system is one manifest line. Includes the encrypted-secrets lifecycle scripts.
-- **[`autoinstall/`](autoinstall)** — Ubuntu Subiquity/cloud-init templates
-  (hardening, GPU drivers, error capture) + `harden-existing.sh` for live boxes.
-- **[`live-rescue/`](live-rescue)** — the `fiehnlab-live` ISO remaster pipeline.
-
-Rocky kickstarts live in `fsc-forge-tokens` (they carry a user password hash, so
-they stay in the private cluster repo); the Rocky ISOs are added to the stick as
-pre-built `file:` entries in the manifest.
-
-## Quick start
+## Build (or rebuild) the stick
 
 ```bash
 cd stick
-./forge-stick.sh install-ventoy /dev/sdX     # once, ERASES the device
-# render values (never committed) go in ~/.config/fiehnlab/stick-secrets.env:
-#   PRIMARY_USER=alice
-#   USER_PW_HASH='...'          # SINGLE-QUOTED; generate with: openssl passwd -6
-#   SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # or rely on ~/.ssh/id_ed25519.pub
-#   LLM_GATEWAY_URL=https://llm.example.com/v1          # optional (online gateway)
-./forge-stick.sh fetch                        # get the ISOs into staging
-./forge-stick.sh all /dev/sdX                 # render seeds + write the stick
-# then create + populate the encrypted secrets container — see stick/README.md
+./forge-stick.sh install-ventoy /dev/sdX   # first time only — ERASES the device
+./forge-stick.sh all /dev/sdX              # copy the ISOs + write the config
 ```
 
-## Relationship to the rest of the fleet
+That's the short version. The full walkthrough — ISOs, the autoinstall login,
+and the encrypted secrets container — is in **[stick/README.md](stick/README.md)**.
 
-The autoinstall/live-rescue/kickstart content is also used by the cluster
-provisioning repo (`fsc-forge-tokens`); this repo is the standalone, portable
-home for building the USB itself. The AI rescue brains ship from the separate
-[`berlinguyinca/pi-rescue`](https://github.com/berlinguyinca/pi-rescue) extension,
-cloned into the image at build time.
+## Add another system later
 
-> Private by design: the templates reference internal hostnames, addressing, and
-> BMC/network topology.
+Add one line to [`stick/stick.manifest`](stick/stick.manifest), then
+`./forge-stick.sh sync <stick>`. Done.
+
+## No secrets in this repo
+
+Only tooling and templates live here — no ISOs, keys, or passwords. Per-machine
+values (login user, password hash, SSH key, gateway URL) are filled in **at build
+time** from an uncommitted file on your own machine, and runtime secrets live in
+an **encrypted LUKS container** on the stick that unlocks into RAM at boot.
+Details: [stick/README.md#secrets](stick/README.md#secrets).

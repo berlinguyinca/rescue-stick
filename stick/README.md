@@ -1,80 +1,70 @@
-# fiehnlab provisioning USB — forge & extend
+# Forge & extend the stick
 
-Reproducibly (re)build the Ventoy multiboot stick: the autoinstall images
-(gpu-node / desktop), the `fiehnlab-live` rescue+work ISO, standalone ISOs
-(Rocky, etc.), and the encrypted secrets container — all driven by
-[`stick.manifest`](stick.manifest).
-
-A Ventoy stick is simple: install Ventoy **once**, then every ISO is just a file
-on the exFAT data partition. Ventoy's `auto_install` plugin (in
-`/ventoy/ventoy.json`) maps each ISO to its autoinstall seed. `forge-stick.sh`
-renders those seeds and writes everything out.
-
-## Layout
+`forge-stick.sh` builds the whole USB from [`stick.manifest`](stick.manifest).
+You install Ventoy **once**; after that every ISO is just a file on the stick,
+and `forge-stick.sh` writes the autoinstall config for you.
 
 ```
 stick/
-├── stick.manifest     one line per bootable system (role | iso | source | seed)
-├── forge-stick.sh     install-ventoy | fetch | render | sync | all
-├── secrets/           container lifecycle (TOOLING only — never secrets)
-│   ├── create-secrets.sh      make a fresh empty LUKS2 container + layout
-│   ├── add-ssh-key.sh         add id_ed25519 (+ known_hosts/config)
-│   └── add-secrets-extra.sh   add tailscale / BMC+recovery / MikroTik / pgpass
-└── README.md
+├── stick.manifest   one line per bootable system:  role | iso | source | seed
+├── forge-stick.sh   install-ventoy | fetch | render | sync | all
+└── secrets/         encrypted-container scripts (tooling only — never secrets)
+                       create-secrets.sh · add-ssh-key.sh · add-secrets-extra.sh
 ```
-Seeds come from [`../autoinstall/*.user-data.tmpl`](../autoinstall); the rescue
-ISO from [`../live-rescue/build-live.sh`](../live-rescue); Rocky kickstarts live in the `fsc-forge-tokens` cluster repo.
 
-## First-time forge (fresh stick)
+## Build a fresh stick
 
 ```bash
-cd provision/stick
-# 1. Install Ventoy (ERASES the device — pick the right /dev/sdX!)
+cd stick
+
+# 1) Install Ventoy — this ERASES the device, so double-check /dev/sdX.
 ./forge-stick.sh install-ventoy /dev/sdX
-# 2. Put render values (never committed) in ~/.config/fiehnlab/stick-secrets.env:
+
+# 2) Put your per-machine values in ~/.config/fiehnlab/stick-secrets.env.
+#    They're never committed; forge injects them into the autoinstall logins:
 #      PRIMARY_USER=alice
-#      USER_PW_HASH='...'       # SINGLE-QUOTED! generate with: openssl passwd -6
-#      SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # or rely on ~/.ssh/id_ed25519.pub
-#      LLM_GATEWAY_URL=https://llm.example.com/v1          # optional
-# 3. Get the ISOs into staging (~/fiehnlab-stick/isos) and render + write the stick
-./forge-stick.sh fetch            # downloads url: ISOs; copies file: ISOs
-#    built: ISOs (fiehnlab-live) are heavy — build then stage them:
-#      ../live-rescue/build-live.sh … && cp …/fiehnlab-live.iso ~/fiehnlab-stick/isos/
-./forge-stick.sh all /dev/sdX     # = render + sync  (re-plug the stick after install-ventoy)
-# 4. Create + populate the encrypted secrets container (real terminal; see below)
-sudo bash secrets/create-secrets.sh /media/$USER/FIEHNLAB/fiehnlab-secrets.luks
-sudo bash secrets/add-ssh-key.sh      /media/$USER/FIEHNLAB/fiehnlab-secrets.luks
-sudo bash secrets/add-secrets-extra.sh /media/$USER/FIEHNLAB/fiehnlab-secrets.luks
+#      USER_PW_HASH='...'        # single-quoted! make one with:  openssl passwd -6
+#      SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # or just have ~/.ssh/id_ed25519.pub
+#      LLM_GATEWAY_URL=https://llm.example.com/v1          # optional (online model gateway)
+
+# 3) Fetch the ISOs, then write the stick.
+./forge-stick.sh fetch           # downloads/copies the manifest's ISOs into ~/fiehnlab-stick/isos
+./forge-stick.sh all /dev/sdX    # render logins + copy ISOs + write ventoy.json
 ```
 
-## Re-forge / refresh an existing stick
+`fiehnlab-live` is a large custom build — build it with
+[`../live-rescue/build-live.sh`](../live-rescue) and drop the resulting ISO into
+`~/fiehnlab-stick/isos/` before step 3.
 
-Ventoy is already installed — just update ISOs, seeds, and `ventoy.json`:
+## Refresh a stick you already have
+
 ```bash
-./forge-stick.sh all /media/$USER/FIEHNLAB      # or pass the /dev node
+./forge-stick.sh all /media/$USER/FIEHNLAB     # or pass the /dev node
 ```
-Existing ISOs are only recopied when the staged one is newer; the secrets
-container on the stick is **never** overwritten.
 
-## Add another system later
+Only changed ISOs are recopied; the secrets container is never overwritten.
 
-1. Append a line to `stick.manifest` (`role|iso|source|seed`).
-2. Stage its ISO (`./forge-stick.sh fetch`, or drop it in `~/fiehnlab-stick/isos/`).
-3. `./forge-stick.sh sync <device|mount>` — it copies the ISO and, if the row
-   has an autoinstall seed, renders it and adds the `ventoy.json` mapping.
+## Add another system
 
-Boot the stick → Ventoy menu lists every ISO; autoinstall systems run unattended.
+1. Append a line to [`stick.manifest`](stick.manifest) (`role | iso | source | seed`).
+2. `./forge-stick.sh fetch` (or drop the ISO in `~/fiehnlab-stick/isos/`).
+3. `./forge-stick.sh sync <device|mount>`.
 
-## Secrets container (encrypted, passphrase-gated)
+Boot the stick and Ventoy lists every ISO; autoinstall entries run unattended.
 
-`fiehnlab-secrets.luks` is a LUKS2 (AES-XTS-512 / Argon2id) container on the
-exFAT partition. It holds the gateway key, gh token, AWS profiles, SSH identity,
-tailscale key, BMC/MikroTik/recovery creds, and `.pgpass`. The live image's
-`fiehnlab-unlock` opens it (passphrase) and loads everything into the running
-session's RAM only — **nothing secret is ever written to an image or to git.**
-The `secrets/` scripts only ever *prompt* for values; losing the stick without
-the passphrase leaks nothing.
+## Secrets
 
-> Build host note: the chroot-based builders (`build-live.sh`) make the chroot's
-> `/dev` and `/run` **rslave** so a build can never leak mounts back onto the
-> host's `/dev/pts` (that bug manifests as `sudo: unable to allocate pty`).
+`fiehnlab-secrets.luks` is an encrypted (LUKS2) container on the stick holding
+your SSH key, gateway / GitHub / AWS creds, tailscale key, BMC & MikroTik logins
+and `.pgpass`. Create and fill it in a real terminal — it prompts for a
+passphrase, and nothing is echoed:
+
+```bash
+sudo bash secrets/create-secrets.sh        # make the container
+sudo bash secrets/add-ssh-key.sh           # add your SSH identity
+sudo bash secrets/add-secrets-extra.sh     # tailscale / BMC / MikroTik / .pgpass
+```
+
+On the live image, `fiehnlab-unlock` opens it (passphrase) and loads everything
+into RAM for that session only. Lose the stick and — without the passphrase —
+nothing leaks.
