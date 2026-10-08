@@ -27,6 +27,19 @@ download and which profile to run.
    build time by `LLM_GATEWAY_URL` (comma-separated) and on the node by
    `/etc/fiehnlab/gateways`.
 
+5. **Tokenless enrollment grants only the `node` role.** A challenge for any
+   other role (`gateway`, `edge`, ...) is refused. Peer/gateway credentials
+   still need an operator-issued code. (Spec 47 section 5.2.)
+6. **A proof-enrolled node may register hardware only.** The Rust gateway
+   refuses (403) a tokenless-enrolled node that registers an endpoint or models,
+   so a stranger cannot aim traffic at a host of their choosing.
+
+Implementation notes found while building (2026-10-08): the Rust gateway issued
+proof credentials from a store that `/v1/node/register` did not consult, and
+rejected `deployment: ""`; both are fixed on the Rust branch. The Go gateway had
+no tokenless routes at all; they are added on its branch. The agent was verified
+against local builds of both gateways.
+
 Tension noted: the peer-trust spec argues token-free enrolment makes bans easy
 to evade. Open registration accepts that. The Ed25519 identity keeps
 quarantine and revocation by key working, and a newly registered node gets
@@ -40,8 +53,9 @@ the lowest trust tier.
 
 ## Findings that shape the design
 
-- Rust already has tokenless enrollment: `/v1/node/key` (register a public
-  key), `/v1/node/challenge`, `/v1/node/proof` (returns the credential).
+- Rust has the tokenless routes `/v1/node/key`, `/v1/node/challenge` and
+  `/v1/node/proof`, but (before this work) their credential was not accepted by
+  `/v1/node/register`.
 - Rust `/v1/node/register` already takes `vram_bytes`, `kv_bytes`, `gpu_ids`
   and `card`, and follows an additive-optional-field convention (older nodes
   keep joining). It does not carry CPU, RAM, disks or NICs.
