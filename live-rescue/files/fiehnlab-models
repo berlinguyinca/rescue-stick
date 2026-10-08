@@ -57,7 +57,7 @@ PY
 
 do_curated() {
   local line repo quant kind name
-  line=$(echo "$CURATED" | fzf --header "curated models (Tab/Enter to pick)" --delimiter '|') || return 0
+  line=$(echo "$CURATED" | grep -vE '^[[:space:]]*#' | fzf --header "curated models (grouped by size) — Enter to pull" --delimiter '|') || return 0
   [ -n "$line" ] || return 0
   name=$(echo "$line"  | awk -F'|' '{print $1}' | xargs)
   repo=$(echo "$line"  | awk -F'|' '{print $2}' | xargs)
