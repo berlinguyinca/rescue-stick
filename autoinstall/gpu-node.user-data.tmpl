@@ -443,8 +443,16 @@ autoinstall:
             # the driver; retries next boot on failure.
             if ! nvidia-smi >/dev/null 2>&1; then
               export DEBIAN_FRONTEND=noninteractive
-              apt-get update >>"$L" 2>&1
-              apt-get install -y "linux-headers-$(uname -r)" cuda-drivers >>"$L" 2>&1 \
+              # A reboot or power cut in the middle of the (long) driver install leaves dpkg
+              # half-configured, and every later retry then fails with "dpkg was interrupted"
+              # for ever. Heal that first. Wait for the dpkg lock (unattended-upgrades may hold
+              # it) rather than failing, force IPv4 (nvidia.github.io fetches over a broken IPv6
+              # path stalled apt for hours), and keep the log small (-q, no pty progress).
+              APT="apt-get -q -o DPkg::Lock::Timeout=900 -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o Dpkg::Use-Pty=0"
+              dpkg --configure -a >>"$L" 2>&1 || true
+              $APT -f install -y >>"$L" 2>&1 || true
+              $APT update >>"$L" 2>&1
+              $APT install -y "linux-headers-$(uname -r)" cuda-drivers >>"$L" 2>&1 \
                 && echo "OK: cuda-drivers (latest NVIDIA) installed" >>"$L" \
                 || echo "FAILED: cuda-drivers install (will retry next boot)" >>"$L"
               modprobe nvidia >>"$L" 2>&1 || true
