@@ -39,6 +39,41 @@ load_manifest(){
   [ "${#ROLES[@]}" -gt 0 ] || die "no systems in $MANIFEST"
 }
 
+# Every key that may log in to a freshly installed system, as one YAML flow list in SSH_KEYS_YAML.
+# Sources, merged and de-duplicated: SSH_AUTHORIZED_KEY (may hold several lines), the keys file
+# (SSH_AUTHORIZED_KEYS_FILE, default ~/.config/fiehnlab/authorized_keys) and this host's own
+# ~/.ssh/*.pub. Revoked files do not end in .pub, so they are never picked up. Set
+# SSH_AUTHORIZED_KEYS_ONLY=1 to skip the host's own keys. Seeds are key-only SSH, so a key
+# missing here means nobody can log in: every key is checked with ssh-keygen and anything
+# that could break sed or YAML is refused.
+collect_ssh_keys(){
+  local file="${SSH_AUTHORIZED_KEYS_FILE:-$HOME/.config/fiehnlab/authorized_keys}"
+  local -a keys=() seen=()
+  local line key f fp
+  add_key(){
+    key="$(printf '%s' "$1" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$key" ] && return 0
+    case "$key" in \#*) return 0;; esac
+    printf '%s' "$key" | grep -qE '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+( [^"|&\\`$]*)?$' \
+      || die "not an acceptable SSH public key line (options such as command= are not supported; no quotes, | & \\ \` \$ allowed): $key"
+    fp="$(printf '%s\n' "$key" | ssh-keygen -l -f /dev/stdin 2>/dev/null | awk '{print $2}')"
+    [ -n "$fp" ] || die "ssh-keygen rejects this public key: $key"
+    for s in "${seen[@]:-}"; do [ "$s" = "$fp" ] && return 0; done
+    seen+=("$fp"); keys+=("$key")
+  }
+  while IFS= read -r line; do add_key "$line"; done <<< "${SSH_AUTHORIZED_KEY:-}"
+  if [ -f "$file" ]; then while IFS= read -r line || [ -n "$line" ]; do add_key "$line"; done < "$file"
+  elif [ -n "${SSH_AUTHORIZED_KEYS_FILE:-}" ]; then die "SSH_AUTHORIZED_KEYS_FILE $file does not exist"; fi
+  if [ "${SSH_AUTHORIZED_KEYS_ONLY:-0}" != 1 ]; then
+    for f in "$HOME"/.ssh/*.pub; do [ -f "$f" ] && while IFS= read -r line || [ -n "$line" ]; do add_key "$line"; done < "$f"; done
+  fi
+  SSH_KEYS_YAML=""
+  [ "${#keys[@]}" -gt 0 ] || return 0
+  for key in "${keys[@]}"; do SSH_KEYS_YAML="${SSH_KEYS_YAML:+$SSH_KEYS_YAML, }\"$key\""; done
+  SSH_KEYS_YAML="[ $SSH_KEYS_YAML ]"
+  log "authorizing ${#keys[@]} SSH key(s): $(printf '%s ' "${seen[@]}")"
+}
+
 load_config(){
   # Resolve render values from the environment or the uncommitted secrets file.
   # NONE are stored in the repo. stick-secrets.env may set PRIMARY_USER,
@@ -48,22 +83,20 @@ load_config(){
   : "${PRIMARY_USER:=}"; : "${USER_PW_HASH:=}"; : "${SSH_AUTHORIZED_KEY:=}"
   : "${LLM_GATEWAY_URL:=https://llm.example.com/v1}"
   : "${NODE_GATEWAYS:=https://llm.metabolomics.us}"   # comma-separated InferWeave gateways a gpu-node registers with
-  # Fall back to the local ed25519 public key if no key was given explicitly.
-  if [ -z "$SSH_AUTHORIZED_KEY" ] && [ -f "$HOME/.ssh/id_ed25519.pub" ]; then
-    SSH_AUTHORIZED_KEY="$(cat "$HOME/.ssh/id_ed25519.pub")"
-  fi
+  collect_ssh_keys
   # NODE_GATEWAYS goes through sed into the seed: allow only URL characters and commas.
   printf '%s' "$NODE_GATEWAYS" | grep -qE '^[A-Za-z0-9:/._,-]+$' \
     || die "NODE_GATEWAYS may contain only letters, digits and : / . _ , - (comma-separated URLs); got: $NODE_GATEWAYS"
   local miss=""
   [ -n "$PRIMARY_USER" ]       || miss="$miss PRIMARY_USER"
   [ -n "$USER_PW_HASH" ]       || miss="$miss USER_PW_HASH"
-  [ -n "$SSH_AUTHORIZED_KEY" ] || miss="$miss SSH_AUTHORIZED_KEY"
+  [ -n "$SSH_KEYS_YAML" ]      || miss="$miss SSH_AUTHORIZED_KEY"
   [ -z "$miss" ] || die "missing render value(s):$miss
   Put them in $f (or the environment):
     PRIMARY_USER=alice
     USER_PW_HASH=\$(openssl passwd -6)                        # login/sudo password hash
-    SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'         # or ensure ~/.ssh/id_ed25519.pub exists
+    SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'         # one or several (one per line); this host's ~/.ssh/*.pub are added too
+    SSH_AUTHORIZED_KEYS_FILE=~/.config/fiehnlab/authorized_keys  # optional: more keys, one per line (this is the default path)
     LLM_GATEWAY_URL=https://llm.example.com/v1                # optional (online gateway)
     NODE_GATEWAYS=https://llm.metabolomics.us                 # optional (gateways gpu-nodes register with, comma-separated)"
 }
@@ -119,7 +152,7 @@ cmd_render(){
         -e "s|@@LLM_GATEWAY_URL@@|$LLM_GATEWAY_URL|g" \
         -e "s|@@NODE_GATEWAYS@@|$NODE_GATEWAYS|g" \
         -e "s|@@REGISTER_AGENT_B64@@|$agent_b64|g" \
-        -e "s|@@SSH_AUTHORIZED_KEY@@|$SSH_AUTHORIZED_KEY|g" \
+        -e "s|@@SSH_AUTHORIZED_KEYS@@|$SSH_KEYS_YAML|g" \
         "$PROVISION/$seed" > "$SEEDDIR/${role}-user-data"
     if grep -qE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data"; then
       die "$role: unresolved placeholder(s): $(grep -oE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data" | sort -u | tr '\n' ' ')"

@@ -135,8 +135,7 @@ autoinstall:
   ssh:
     install-server: true
     allow-pw: false          # password SSH off at install (drop-in below adds the rest)
-    authorized-keys:
-      - "@@SSH_AUTHORIZED_KEY@@"
+    authorized-keys: @@SSH_AUTHORIZED_KEYS@@
 
   # Normal GDM login (you type the password); hostname here is only a fallback.
   identity:

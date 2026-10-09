@@ -6,8 +6,10 @@ T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
 # Work on a copy so the digit-placeholder case can edit a template safely.
 mkdir "$T/repo"; tar -C "$SRC" --exclude=.git -cf - . | tar -C "$T/repo" -xf -
 cd "$T/repo"
+export HOME="$T/home"; mkdir -p "$HOME/.ssh" "$HOME/.config/fiehnlab"
+mkkey(){ ssh-keygen -q -t ed25519 -N '' -C "$2" -f "$T/k-$1" && cat "$T/k-$1.pub"; }
 export STICK_STAGING="$T/stage" STICK_SECRETS_ENV=/dev/null
-export PRIMARY_USER=tester USER_PW_HASH='$6$x$y' SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA test'
+export PRIMARY_USER=tester USER_PW_HASH='$6$x$y' SSH_AUTHORIZED_KEY="$(mkkey 0 base@test)"
 fail(){ echo "FAIL: $*" >&2; exit 1; }
 
 stick/forge-stick.sh render >/dev/null
@@ -69,4 +71,51 @@ grep -q 'https://b.example' "$T/stage/seeds/gpu-node-user-data" || fail "NODE_GA
 # A placeholder containing digits that is left unresolved must abort the render.
 echo '# @@UNRESOLVED_B64@@' >> autoinstall/gpu-node.user-data.tmpl
 if stick/forge-stick.sh render >/dev/null 2>&1; then fail "digit placeholder was not caught"; fi
+sed -i '/UNRESOLVED_B64/d' autoinstall/gpu-node.user-data.tmpl
+
+# ---- several SSH keys --------------------------------------------------------------------------
+# Keys of the host that forges the stick are authorized by default; more come from a keys file and
+# from a multi-line SSH_AUTHORIZED_KEY; duplicates collapse; revoked ~/.ssh files are ignored.
+KA="$(mkkey a admin@hostA)"; KB="$(mkkey b laptop@hostB)"; KC="$(mkkey c mac@hostC)"; KD="$(mkkey d explicit@hostD)"
+echo "$KA" > "$HOME/.ssh/id_ed25519.pub"
+echo "$KB" > "$HOME/.ssh/id_rsa.pub.revoked-20260924"       # revoked: must NOT be authorized
+printf '# lab keys\n%s\n\n%s\n%s\n' "$KB" "$KC" "$KA" > "$HOME/.config/fiehnlab/authorized_keys"
+export SSH_AUTHORIZED_KEY="$KD"
+rm -rf "$T/stage"; stick/forge-stick.sh render >/dev/null || fail "render with several keys failed"
+python3 - "$T/stage/seeds" "$KA" "$KB" "$KC" "$KD" <<'PY'
+import sys, yaml
+seeds, a, b, c, d = sys.argv[1], *sys.argv[2:6]
+for role in ("gpu-node", "desktop"):
+    keys = yaml.safe_load(open(f"{seeds}/{role}-user-data"))["autoinstall"]["ssh"]["authorized-keys"]
+    assert sorted(keys) == sorted({a, b, c, d}), f"{role}: {keys}"
+    assert len(keys) == 4, f"{role}: duplicates not collapsed: {keys}"
+PY
+# the revoked-file key (KB) is only present because the keys file lists it, not because of ~/.ssh
+rm "$HOME/.config/fiehnlab/authorized_keys"
+rm -rf "$T/stage"; stick/forge-stick.sh render >/dev/null || fail "render failed"
+python3 - "$T/stage/seeds/gpu-node-user-data" "$KA" "$KB" "$KD" <<'PY'
+import sys, yaml
+keys = yaml.safe_load(open(sys.argv[1]))["autoinstall"]["ssh"]["authorized-keys"]
+assert sorted(keys) == sorted([sys.argv[2], sys.argv[4]]) and sys.argv[3] not in keys, keys
+PY
+# a multi-line SSH_AUTHORIZED_KEY works
+SSH_AUTHORIZED_KEY="$(printf '%s\n%s' "$KC" "$KD")" stick/forge-stick.sh render >/dev/null || fail "multi-line SSH_AUTHORIZED_KEY failed"
+python3 - "$T/stage/seeds/gpu-node-user-data" "$KC" <<'PY'
+import sys, yaml
+assert sys.argv[2] in yaml.safe_load(open(sys.argv[1]))["autoinstall"]["ssh"]["authorized-keys"]
+PY
+# SSH_AUTHORIZED_KEYS_ONLY=1 ignores the forging host's own keys
+SSH_AUTHORIZED_KEYS_ONLY=1 stick/forge-stick.sh render >/dev/null || fail "ONLY=1 render failed"
+python3 - "$T/stage/seeds/gpu-node-user-data" "$KA" "$KD" <<'PY'
+import sys, yaml
+assert yaml.safe_load(open(sys.argv[1]))["autoinstall"]["ssh"]["authorized-keys"] == [sys.argv[3]]
+PY
+# bad key material is refused instead of being written into a seed that would lock everyone out
+for bad in 'ssh-ed25519 AAAAnotakey broken@x' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKID8795AIxQCyL4P1ETuwjvrUvBeqOHDqWBpvO30lR1 a"b' 'command="x" ssh-ed25519 AAAA y'; do
+  if SSH_AUTHORIZED_KEY="$bad" stick/forge-stick.sh render >/dev/null 2>&1; then fail "accepted bad key: $bad"; fi
+done
+printf 'not a key\n' > "$HOME/.config/fiehnlab/authorized_keys"
+if stick/forge-stick.sh render >/dev/null 2>&1; then fail "accepted a bad keys file"; fi
+rm "$HOME/.config/fiehnlab/authorized_keys"
+unset SSH_AUTHORIZED_KEY
 echo "PASS"
