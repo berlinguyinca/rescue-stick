@@ -24,7 +24,7 @@ cd stick
 #    They're never committed; forge injects them into the autoinstall logins:
 #      PRIMARY_USER=alice
 #      USER_PW_HASH='...'        # single-quoted! make one with:  openssl passwd -6
-#      SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # or just have ~/.ssh/id_ed25519.pub
+#      SSH_AUTHORIZED_KEY='ssh-ed25519 AAAA... you@host'   # optional; one or several keys, one per line (see SSH keys below)
 #      LLM_GATEWAY_URL=https://llm.example.com/v1          # optional (online model gateway)
 #      NODE_GATEWAYS=https://llm.metabolomics.us           # optional (gateways a gpu-node registers with, comma-separated; this is the default)
 
@@ -36,6 +36,21 @@ cd stick
 `rescue-os` is a large custom build — build it with
 [`../live-rescue/build-live.sh`](../live-rescue) and drop the resulting ISO into
 `~/fiehnlab-stick/isos/` before step 3.
+
+## SSH keys (several are supported)
+
+The installed systems are **key-only SSH** (`AllowUsers` the login user), so a key missing from
+the seed means nobody can log in. `forge-stick.sh render` authorizes the union of:
+
+1. every `~/.ssh/*.pub` on the host you forge from, so that host can always log in (revoked files
+   such as `id_rsa.pub.revoked-…` do not end in `.pub` and are skipped);
+2. `SSH_AUTHORIZED_KEY`, which may hold several keys, one per line;
+3. the keys file `~/.config/fiehnlab/authorized_keys` (or the path in `SSH_AUTHORIZED_KEYS_FILE`),
+   one public key per line, `#` comments allowed. Put your other machines' keys here.
+
+Duplicates collapse, every key is checked with `ssh-keygen`, and the render prints the fingerprints
+it authorizes. Lines with options (`command=…`) or characters that could break the seed are refused.
+Set `SSH_AUTHORIZED_KEYS_ONLY=1` to skip (1).
 
 ## Refresh a stick you already have
 
