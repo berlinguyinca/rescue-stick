@@ -118,4 +118,57 @@ printf 'not a key\n' > "$HOME/.config/fiehnlab/authorized_keys"
 if stick/forge-stick.sh render >/dev/null 2>&1; then fail "accepted a bad keys file"; fi
 rm "$HOME/.config/fiehnlab/authorized_keys"
 unset SSH_AUTHORIZED_KEY
+
+# ---- first-boot GPU setup heals an interrupted dpkg --------------------------------------------
+# A reboot in the middle of `apt-get install cuda-drivers` leaves dpkg half-finished, after which every
+# later retry failed with "dpkg was interrupted" for ever. Run the real script against stubs that
+# model exactly that and require it to recover.
+rm -rf "$T/stage"; stick/forge-stick.sh render >/dev/null
+python3 - "$T/stage/seeds/gpu-node-user-data" "$T/gpu-setup.sh" <<'PY'
+import sys, yaml
+def walk(o):
+    if isinstance(o, dict):
+        if "write_files" in o: return o["write_files"]
+        for v in o.values():
+            r = walk(v)
+            if r: return r
+files = {e["path"]: e["content"] for e in walk(yaml.safe_load(open(sys.argv[1])))}
+open(sys.argv[2], "w").write(files["/usr/local/sbin/fiehnlab-gpu-container-setup.sh"])
+PY
+bash -n "$T/gpu-setup.sh" || fail "gpu setup script has a syntax error"
+G="$T/gpu"; mkdir -p "$G/bin" "$G/etc" "$G/cdi"
+echo "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation TU102 [GeForce RTX 2080 Ti] [10de:1e04]" > "$G/etc/gpu"
+touch "$G/interrupted"                                   # dpkg is half-configured
+cat > "$G/bin/dpkg" <<STUB
+#!/usr/bin/env bash
+echo "dpkg \$*" >> "$G/calls"
+[ "\$1" = "--configure" ] && rm -f "$G/interrupted"
+exit 0
+STUB
+cat > "$G/bin/apt-get" <<STUB
+#!/usr/bin/env bash
+echo "apt-get \$*" >> "$G/calls"
+case " \$* " in *" install "*)
+  if [ -e "$G/interrupted" ]; then echo "E: dpkg was interrupted, you must manually run 'dpkg --configure -a' to correct the problem." >&2; exit 100; fi
+  case " \$* " in *cuda-drivers*) touch "$G/driver";; esac;;
+esac
+exit 0
+STUB
+cat > "$G/bin/nvidia-smi" <<STUB
+#!/usr/bin/env bash
+[ -e "$G/driver" ]
+STUB
+# Every command with a side effect on the host is a no-op stub: the test must never touch the machine it runs on.
+printf '#!/usr/bin/env bash\nexit 0\n' > "$G/bin/modprobe"
+for c in sleep systemctl nvidia-ctk nvidia-persistenced docker; do cp "$G/bin/modprobe" "$G/bin/$c"; done
+printf '#!/usr/bin/env bash\nexit 22\n' > "$G/bin/curl"
+chmod +x "$G/bin/"*
+sed -e "s|/var/log/fiehnlab-provision.log|$G/prov.log|g" -e "s|/etc/fiehnlab|$G/etc|g" -e "s|/etc/cdi|$G/cdi|g" "$T/gpu-setup.sh" > "$G/run.sh"
+PATH="$G/bin:$PATH" bash "$G/run.sh" || fail "gpu setup script exited non-zero"
+grep -q "OK: cuda-drivers" "$G/prov.log" || fail "driver install did not recover from an interrupted dpkg: $(tail -3 "$G/prov.log")"
+cfg=$(grep -n '^dpkg --configure -a' "$G/calls" | head -1 | cut -d: -f1)
+ins=$(grep -n '^apt-get .* install .*cuda-drivers' "$G/calls" | head -1 | cut -d: -f1)
+[ -n "$cfg" ] && [ -n "$ins" ] && [ "$cfg" -lt "$ins" ] || fail "dpkg --configure -a must run before installing the driver (calls: $(tr '\n' ';' < "$G/calls"))"
+grep -q 'DPkg::Lock::Timeout' "$G/calls" || fail "apt-get does not wait for the dpkg lock"
+grep -q 'Acquire::ForceIPv4=true' "$G/calls" || fail "apt-get is not forced to IPv4"
 echo "PASS"
