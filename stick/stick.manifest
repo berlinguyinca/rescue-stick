@@ -11,7 +11,7 @@
 #               built:<builder>    produced by a repo builder (forge won't auto-run heavy builds;
 #                                  build it, drop the result in staging as <iso>)
 #   seed      autoinstall template relative to provision/ , or '-' for none
-#             (templates render @@PRIMARY_USER@@ / @@USER_PW_HASH@@ / @@SSH_AUTHORIZED_KEY@@ / @@LLM_GATEWAY_URL@@; see README)
+#             (templates render @@PRIMARY_USER@@ / @@USER_PW_HASH@@ / @@SSH_AUTHORIZED_KEYS@@ / @@LLM_GATEWAY_URL@@; see README)
 #
 # To ADD a system: append a line here, put its ISO in the staging dir
 # (default ~/fiehnlab-stick/isos/), then:  ./forge-stick.sh sync <device|mount>
