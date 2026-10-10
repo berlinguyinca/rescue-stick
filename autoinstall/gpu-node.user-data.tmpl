@@ -260,6 +260,12 @@ autoinstall:
   # Re-runs each boot until it succeeds (marker: /etc/fiehnlab/.gpu-container-done).
   user-data:
     write_files:
+      # Passwordless sudo for the admin user (matches the cluster_users sudo:true
+      # convention in the Ansible cluster repo). 0440, validated by cloud-init.
+      - path: /etc/sudoers.d/90-fiehnlab-nopasswd
+        permissions: "0440"
+        content: |
+          @@PRIMARY_USER@@ ALL=(ALL) NOPASSWD:ALL
       # ===== Security hardening (pragmatic). Config files written here; applied on
       # first boot by fiehnlab-harden.sh (see runcmd). ufw runs on the real kernel. =====
       - path: /etc/ssh/sshd_config.d/10-fiehnlab-hardening.conf
