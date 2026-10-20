@@ -285,6 +285,12 @@ setup_overlay() {
 chroot_enter() {
   log "chroot hygiene: binds, resolv.conf, policy-rc.d, initramfs diversion, kernel hold"
   sudo -n mount --bind /dev "$M/dev"
+  # Slave $M/dev BEFORE anything is mounted under it. The host's /dev is
+  # shared, so the bind above makes $M/dev a shared peer of it; binding
+  # /dev/pts while $M/dev is still shared propagates the pts mount BACK onto
+  # the host's /dev/pts (the "unable to allocate pty" accumulation bug). The
+  # recursive --make-rslave below re-slaves the pts submount too.
+  sudo -n mount --make-rslave "$M/dev"
   sudo -n mount --bind /dev/pts "$M/dev/pts"
   # CRITICAL: the host's /dev is a SHARED mount (systemd default). Without this,
   # the chroot's /dev/pts activity propagates BACK onto the host's /dev/pts,
