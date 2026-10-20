@@ -478,12 +478,24 @@ autoinstall:
             if command -v nvidia-ctk >/dev/null && nvidia-smi >/dev/null 2>&1; then
               nvidia-ctk cdi generate --output=/etc/cdi/nvidia.yaml >>"$L" 2>&1 && echo "OK: nvidia CDI generated" >>"$L"
               nvidia-ctk runtime configure --runtime=docker >>"$L" 2>&1 && systemctl restart docker >>"$L" 2>&1 && echo "OK: docker nvidia runtime (docker --gpus all ready)" >>"$L"
-              # nvidia_gpu_exporter (utkuozdemir) for the lab's nvidia-gpu Grafana dashboards, :9835
+              # nvidia_gpu_exporter (utkuozdemir) for the lab's nvidia-gpu Grafana dashboards, :9835.
+              # Install DEFENSIVELY: a failed/partial download (API rate-limit, asset rename, no
+              # IPv4) must never leave the unit enabled with a missing ExecStart (status=203) that
+              # crash-loops forever AND is then masked by the done-marker below. Download to a temp
+              # file, verify the binary actually runs, and only enable the unit if it does.
               if [ ! -x /usr/local/bin/nvidia_gpu_exporter ]; then
                 U=$(curl -fsSL https://api.github.com/repos/utkuozdemir/nvidia_gpu_exporter/releases/latest | grep -oE "https://[^\" ]+_linux_x86_64\.tar\.gz" | head -1)
-                curl -fsSL "$U" | tar -xz -C /usr/local/bin nvidia_gpu_exporter >>"$L" 2>&1 && chmod 0755 /usr/local/bin/nvidia_gpu_exporter
+                if [ -n "$U" ] && curl -fsSL "$U" -o /tmp/nge.tgz 2>>"$L" && tar -xzf /tmp/nge.tgz -C /tmp nvidia_gpu_exporter 2>>"$L"; then
+                  install -m0755 /tmp/nvidia_gpu_exporter /usr/local/bin/nvidia_gpu_exporter
+                fi
+                rm -f /tmp/nge.tgz /tmp/nvidia_gpu_exporter
               fi
-              systemctl daemon-reload; systemctl enable --now nvidia_gpu_exporter.service >>"$L" 2>&1 && echo "OK: nvidia_gpu_exporter :9835" >>"$L" || echo "FAILED: nvidia_gpu_exporter" >>"$L"
+              if /usr/local/bin/nvidia_gpu_exporter --version >/dev/null 2>&1; then
+                systemctl daemon-reload; systemctl enable --now nvidia_gpu_exporter.service >>"$L" 2>&1 && echo "OK: nvidia_gpu_exporter :9835" >>"$L" || echo "FAILED: nvidia_gpu_exporter (unit)" >>"$L"
+              else
+                systemctl disable --now nvidia_gpu_exporter.service >/dev/null 2>&1 || true
+                echo "WARN: nvidia_gpu_exporter binary unavailable (download failed); unit left DISABLED, no crash-loop. Fix: install /usr/local/bin/nvidia_gpu_exporter then 'systemctl enable --now nvidia_gpu_exporter'." >>"$L"
+              fi
               # Keep the driver resident on this headless compute node: stable clocks/ECC,
               # no per-job driver teardown, faster job start. cuda-drivers already installs
               # nvidia-persistenced; just make sure it is enabled.
