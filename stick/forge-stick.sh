@@ -193,16 +193,49 @@ cmd_sync(){
     [ -f "$s" ] || die "seed for ${ROLES[$i]} not rendered — run: $0 render"
     cp -f "$s" "$mnt/ventoy/${ROLES[$i]}-user-data"
   done
-  # ventoy.json auto_install mapping (only rows with a seed)
-  { echo '{'; echo '  "auto_install": ['; local first=1
+  # ventoy.json auto_install mapping (rows with a seed), GROUPED by image so one
+  # ISO can offer several role templates. gpu-node and cpu-node share the Ubuntu
+  # Server ISO this way (Ventoy shows a template picker at boot) -> no duplicate
+  # 4GB ISO. One seed per image -> plain string; several -> a JSON array.
+  {
+    echo '{'
+    echo '  "auto_install": ['
+    local imgs=() img seedimg
     for i in "${!ROLES[@]}"; do
       [ "${SEEDS[$i]}" = "-" ] && continue
-      [ "$first" = 1 ] || echo '    },'; first=0
-      echo '    {'
-      echo "      \"image\": \"/${ISOS[$i]}\","
-      echo "      \"template\": \"/ventoy/${ROLES[$i]}-user-data\""
+      seedimg="${ISOS[$i]}"
+      case " ${imgs[*]-} " in *" $seedimg "*) ;; *) imgs+=("$seedimg") ;; esac
     done
-    echo '    }'; echo '  ]'; echo '}'
+    local gi=0
+    for img in "${imgs[@]}"; do
+      gi=$((gi+1)); [ "$gi" -gt 1 ] && echo '    },'
+      echo '    {'
+      echo "      \"image\": \"/$img\","
+      local tmpls=() t
+      for i in "${!ROLES[@]}"; do
+        [ "${SEEDS[$i]}" = "-" ] && continue
+        [ "${ISOS[$i]}" = "$img" ] && tmpls+=("/ventoy/${ROLES[$i]}-user-data")
+      done
+      if [ "${#tmpls[@]}" -eq 1 ]; then
+        echo "      \"template\": \"${tmpls[0]}\""
+      else
+        echo '      "template": ['
+        local k=0 n=${#tmpls[@]}
+        for t in "${tmpls[@]}"; do
+          k=$((k+1))
+          if [ "$k" -lt "$n" ]; then echo "        \"$t\","; else echo "        \"$t\""; fi
+        done
+        # autosel is 1-BASED -> default to the first template (gpu-node); timeout
+        # keeps the picker visible for 10s so cpu-node is still selectable, then
+        # auto-boots the default. Preserves the hands-off gpu-node install.
+        echo '      ],'
+        echo '      "autosel": 1,'
+        echo '      "timeout": 10'
+      fi
+    done
+    echo '    }'
+    echo '  ]'
+    echo '}'
   } > "$mnt/ventoy/ventoy.json"
   log "wrote $mnt/ventoy/ventoy.json"
   # Secrets container: copy a staged one only if the stick has none (never overwrite).

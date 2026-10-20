@@ -70,9 +70,10 @@ autoinstall:
       import subprocess, sys, yaml, random
 
       # --- choose a random Futurama character not already in DNS -------------
-      # fry / admin-workstation / zoidberg are already taken, so they're excluded from the pool.
-      POOL = ['leela','farnsworth','amy','hermes','zapp','kif','nibbler','scruffy',
-              'calculon','morbo','flexo','roberto','clamps','mom','nixon','cubert',
+      # Live nodes not in DNS (nibbler/zapp/cubert) plus fry/admin-workstation/zoidberg
+      # are already taken, so they're excluded from the pool to avoid a name collision.
+      POOL = ['leela','farnsworth','amy','hermes','kif','scruffy',
+              'calculon','morbo','flexo','roberto','clamps','mom','nixon',
               'lrrr','hypnotoad','donbot','wernstrom','hedonismbot']
       def taken(name):
           for host in (name + '.fiehnlab.ucdavis.edu', name):

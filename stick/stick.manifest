@@ -18,6 +18,7 @@
 #
 # role|iso|source|seed
 gpu-node|ubuntu-24.04.5-live-server-amd64.iso|url:https://releases.ubuntu.com/24.04/ubuntu-24.04.5-live-server-amd64.iso|autoinstall/gpu-node.user-data.tmpl
+cpu-node|ubuntu-24.04.5-live-server-amd64.iso|url:https://releases.ubuntu.com/24.04/ubuntu-24.04.5-live-server-amd64.iso|autoinstall/cpu-node.user-data.tmpl
 desktop|ubuntu-24.04.5.1-desktop-amd64.iso|url:https://releases.ubuntu.com/24.04/ubuntu-24.04.5.1-desktop-amd64.iso|autoinstall/desktop.user-data.tmpl
 rescue-os|rescue-os.iso|built:live-rescue/build-live.sh|-
 rocky-kvm-node|Rocky-9.8-ks-kvm-node-12.iso|file:|-
