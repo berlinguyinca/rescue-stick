@@ -8,9 +8,12 @@ set -uo pipefail
 V=$(lspci -nn | grep -iE 'VGA|3D|Display')
 echo "$V"
 if echo "$V" | grep -qi nvidia; then
-  echo "[fiehnlab-gpu] NVIDIA detected; installing latest cuda-drivers against $(uname -r)"
+  # Proprietary driver (lab policy): open modules drop pre-Turing cards (GTX 1080 Ti etc.).
+  DRV=$(apt-cache search '^nvidia-driver-[0-9]+$' 2>/dev/null | grep -oE 'nvidia-driver-[0-9]+' | sort -t- -k3 -n | tail -1)
+  [ -n "$DRV" ] || DRV=nvidia-driver-580
+  echo "[fiehnlab-gpu] NVIDIA detected; installing proprietary $DRV against $(uname -r)"
   apt-get update
-  apt-get install -y "linux-headers-$(uname -r)" cuda-drivers nvidia-container-toolkit
+  apt-get install -y "linux-headers-$(uname -r)" "$DRV" nvidia-container-toolkit
   nvidia-ctk runtime configure --runtime=docker && systemctl restart docker
   echo "[fiehnlab-gpu] done. You may need to modprobe nvidia or reboot this session."
 elif echo "$V" | grep -qiE '\[1002:'; then

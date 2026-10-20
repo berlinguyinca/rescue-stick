@@ -140,8 +140,9 @@ autoinstall:
       PY
 
   # ---- Proprietary GPU drivers (NVIDIA handled here automatically) --------
-  # NVIDIA driver is installed FIRST BOOT from the NVIDIA CUDA repo (latest
-  # cuda-drivers, incl. open modules for recent GPUs) against the running kernel,
+  # NVIDIA driver is installed FIRST BOOT from the NVIDIA CUDA repo (newest
+  # PROPRIETARY nvidia-driver-NNN branch — lab policy; open modules drop pre-Turing
+  # cards like the GTX 1080 Ti) against the running kernel,
   # NOT subiquity's recommended driver — avoids a dual-source conflict and
   # guarantees "latest". AMD: latest ROCm via amdgpu-install. See the GPU
   # late-command (adds the repo) + the first-boot GPU setup script (installs it).
@@ -458,9 +459,15 @@ autoinstall:
               dpkg --configure -a >>"$L" 2>&1 || true
               $APT -f install -y >>"$L" 2>&1 || true
               $APT update >>"$L" 2>&1
-              $APT install -y "linux-headers-$(uname -r)" cuda-drivers >>"$L" 2>&1 \
-                && echo "OK: cuda-drivers (latest NVIDIA) installed" >>"$L" \
-                || echo "FAILED: cuda-drivers install (will retry next boot)" >>"$L"
+              # Lab policy: PROPRIETARY NVIDIA modules, never open. The open module only
+              # supports Turing+ and silently drops Pascal/Maxwell (e.g. GTX 1080 Ti), so
+              # cuda-drivers (open by default) leaves older cards driverless. Install the
+              # newest proprietary nvidia-driver-NNN branch (excludes -open / -server).
+              DRV=$(apt-cache search '^nvidia-driver-[0-9]+$' 2>/dev/null | grep -oE 'nvidia-driver-[0-9]+' | sort -t- -k3 -n | tail -1)
+              [ -n "$DRV" ] || DRV=nvidia-driver-580
+              $APT install -y "linux-headers-$(uname -r)" "$DRV" >>"$L" 2>&1 \
+                && echo "OK: proprietary $DRV installed" >>"$L" \
+                || echo "FAILED: $DRV install (will retry next boot)" >>"$L"
               modprobe nvidia >>"$L" 2>&1 || true
             fi
             for i in $(seq 1 36); do nvidia-smi >/dev/null 2>&1 && break; sleep 5; done
@@ -484,7 +491,17 @@ autoinstall:
               if nvidia-smi -L >/dev/null 2>&1 && [ -z "$ECCU" ]; then echo "OK: GPU acceptance (all cards visible, no uncorrectable ECC)" >>"$L"; else echo "FAILED: GPU acceptance (card missing or uncorrectable ECC: ${ECCU:-none}) -- INSPECT THIS CARD" >>"$L"; fi
               touch "$M"
             else
-              echo "WAIT: nvidia driver not ready; retry next boot" >>"$L"; exit 0
+              # Driver installed but the module needs a fresh boot to load (nouveau
+              # blacklist + initramfs rebuild). Auto-reboot ONCE (marker-guarded) so a
+              # headless node comes up GPU-ready with no human; after that, retry each boot.
+              if [ ! -f /etc/fiehnlab/.gpu-autoreboot ]; then
+                mkdir -p /etc/fiehnlab; touch /etc/fiehnlab/.gpu-autoreboot
+                echo "WAIT: driver installed; auto-rebooting once to load the module" >>"$L"
+                systemctl reboot
+              else
+                echo "WAIT: nvidia driver not ready; retry next boot" >>"$L"
+              fi
+              exit 0
             fi
           elif echo "$V" | grep -qiE "\[1002:"; then
             if command -v amd-ctk >/dev/null 2>&1; then
@@ -546,7 +563,7 @@ autoinstall:
           WantedBy=multi-user.target
     runcmd:
       - [ bash, /usr/local/sbin/fiehnlab-harden.sh ]
-      - [ systemctl, enable, fiehnlab-gpu-container.service ]
+      - [ systemctl, enable, --now, fiehnlab-gpu-container.service ]
       - [ systemctl, enable, --now, --no-block, fiehnlab-register.service ]
 
   # Reboot into the installed system when done
