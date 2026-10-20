@@ -463,11 +463,15 @@ autoinstall:
               # supports Turing+ and silently drops Pascal/Maxwell (e.g. GTX 1080 Ti), so
               # cuda-drivers (open by default) leaves older cards driverless. Install the
               # newest proprietary nvidia-driver-NNN branch (excludes -open / -server).
-              DRV=$(apt-cache search '^nvidia-driver-[0-9]+$' 2>/dev/null | grep -oE 'nvidia-driver-[0-9]+' | sort -t- -k3 -n | tail -1)
-              [ -n "$DRV" ] || DRV=nvidia-driver-580
-              $APT install -y "linux-headers-$(uname -r)" "$DRV" >>"$L" 2>&1 \
-                && echo "OK: proprietary $DRV installed" >>"$L" \
-                || echo "FAILED: $DRV install (will retry next boot)" >>"$L"
+              # PINNED to the newest branch that still supports the OLDEST cards in the
+              # fleet. NOT "latest": Pascal (GTX 1080 Ti) support ENDS at 580 — 590/610/615
+              # drop it (open OR proprietary), so "latest" leaves Pascal cards driverless.
+              # Verified 2026-10-20: 580 drives 1080 Ti (Pascal) + 2080 Ti (Turing).
+              # BUMP THIS when Pascal is retired from the fleet.
+              NV_BRANCH=580
+              $APT install -y "linux-headers-$(uname -r)" "nvidia-driver-$NV_BRANCH" >>"$L" 2>&1 \
+                && echo "OK: proprietary nvidia-driver-$NV_BRANCH installed" >>"$L" \
+                || echo "FAILED: nvidia-driver-$NV_BRANCH install (will retry next boot)" >>"$L"
               modprobe nvidia >>"$L" 2>&1 || true
             fi
             for i in $(seq 1 36); do nvidia-smi >/dev/null 2>&1 && break; sleep 5; done

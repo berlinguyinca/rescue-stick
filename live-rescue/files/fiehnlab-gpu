@@ -9,8 +9,9 @@ V=$(lspci -nn | grep -iE 'VGA|3D|Display')
 echo "$V"
 if echo "$V" | grep -qi nvidia; then
   # Proprietary driver (lab policy): open modules drop pre-Turing cards (GTX 1080 Ti etc.).
-  DRV=$(apt-cache search '^nvidia-driver-[0-9]+$' 2>/dev/null | grep -oE 'nvidia-driver-[0-9]+' | sort -t- -k3 -n | tail -1)
-  [ -n "$DRV" ] || DRV=nvidia-driver-580
+  # PINNED proprietary branch: newest that supports the oldest fleet cards. Pascal
+  # (GTX 1080 Ti) support ends at 580; 590/610/615 drop it. Bump when Pascal retired.
+  DRV=nvidia-driver-580
   echo "[fiehnlab-gpu] NVIDIA detected; installing proprietary $DRV against $(uname -r)"
   apt-get update
   apt-get install -y "linux-headers-$(uname -r)" "$DRV" nvidia-container-toolkit
