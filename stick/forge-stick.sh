@@ -147,13 +147,26 @@ cmd_render(){
     [ "$seed" = "-" ] && continue
     [ -f "$PROVISION/$seed" ] || die "$role: template $PROVISION/$seed not found"
     local agent_b64; agent_b64="$(base64 -w0 "$PROVISION/autoinstall/files/fiehnlab-register")"
-    sed -e "s|@@PRIMARY_USER@@|$PRIMARY_USER|g" \
+    # Per-role flags. A role ending in -vulkan enables the Vulkan/llama.cpp path:
+    # @@IFVULKAN@@..@@ENDIF@@ blocks are kept only then (awk strips the markers, and
+    # the block body too when disabled), and @@ROLE@@/@@VULKAN@@ are substituted
+    # below. One template thus yields cpu-node (pure) and cpu-node-vulkan.
+    local vulkan=0; case "$role" in *-vulkan) vulkan=1 ;; esac
+    awk -v keep="$vulkan" '
+      /@@IFVULKAN@@/ { skip=(keep!="1"); next }
+      /@@ENDIF@@/    { skip=0; next }
+      skip          { next }
+      { print }
+    ' "$PROVISION/$seed" \
+    | sed -e "s|@@PRIMARY_USER@@|$PRIMARY_USER|g" \
         -e "s|@@USER_PW_HASH@@|$USER_PW_HASH|g" \
         -e "s|@@LLM_GATEWAY_URL@@|$LLM_GATEWAY_URL|g" \
         -e "s|@@NODE_GATEWAYS@@|$NODE_GATEWAYS|g" \
         -e "s|@@REGISTER_AGENT_B64@@|$agent_b64|g" \
         -e "s|@@SSH_AUTHORIZED_KEYS@@|$SSH_KEYS_YAML|g" \
-        "$PROVISION/$seed" > "$SEEDDIR/${role}-user-data"
+        -e "s|@@ROLE@@|$role|g" \
+        -e "s|@@VULKAN@@|$vulkan|g" \
+        > "$SEEDDIR/${role}-user-data"
     if grep -qE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data"; then
       die "$role: unresolved placeholder(s): $(grep -oE '@@[A-Z0-9_]+@@' "$SEEDDIR/${role}-user-data" | sort -u | tr '\n' ' ')"
     fi

@@ -1,6 +1,9 @@
 #cloud-config
 # =============================================================================
-# Fiehnlab CPU-node unattended Ubuntu Server install   (role label: cpu-node)
+# Fiehnlab CPU-node unattended Ubuntu Server install   (roles: cpu-node / cpu-node-vulkan)
+# ONE template, TWO render variants: forge-stick sets @@ROLE@@/@@VULKAN@@ from the manifest
+# role. cpu-node = pure CPU, never touches the GPU. cpu-node-vulkan = also light llama.cpp
+# inference on a legacy AMD GPU (stock Mesa RADV Vulkan; for cards modern ROCm/CUDA dropped).
 # -----------------------------------------------------------------------------
 # TEMPLATE. Build step must substitute @@USER_PW_HASH@@ with the real
 # sha512crypt hash (kept OUT of git per the "no passwords in GitHub" rule) to
@@ -184,11 +187,13 @@ autoinstall:
     - htop
     - vim
     - prometheus-node-exporter   # host metrics on :9100 for the lab Prometheus/Grafana
+    # @@IFVULKAN@@ (cpu-node-vulkan variant only; pure cpu-node omits the whole block)
     # Open Vulkan compute stack for LIGHT LLM inference on legacy AMD GPUs (RADV).
     - mesa-vulkan-drivers        # RADV: drives GCN1/Southern-Islands FirePro via amdgpu
     - vulkan-tools               # vulkaninfo (Vulkan acceptance check)
     - libvulkan1                 # Vulkan loader
     - libgomp1                   # OpenMP runtime (llama.cpp ggml-cpu .so need libgomp.so.1)
+    # @@ENDIF@@
 
   updates: security
 
@@ -238,7 +243,7 @@ autoinstall:
   late-commands:
     # Role label
     - |-
-      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/fiehnlab && echo cpu-node > /etc/fiehnlab/role'
+      curtin in-target --target=/target -- bash -c 'mkdir -p /etc/fiehnlab && echo @@ROLE@@ > /etc/fiehnlab/role'
     # Admin group memberships (docker.io creates the docker group)
     - |-
       curtin in-target --target=/target -- bash -c 'L=/var/log/fiehnlab-provision.log; { getent group docker >/dev/null || groupadd docker; usermod -aG docker @@PRIMARY_USER@@; echo "OK: docker group"; } >>$L 2>&1 || echo "FAILED: docker group" >>$L'
@@ -417,7 +422,7 @@ autoinstall:
             ufw default allow outgoing >>"$L" 2>&1
             ufw allow 22/tcp >>"$L" 2>&1
             # cpu-node: also open the llama.cpp inference port (read from llama.env).
-            LLPORT=""; [ "$ROLE" = "cpu-node" ] && LLPORT=$(. /etc/fiehnlab/llama.env 2>/dev/null; echo "${PORT:-8080}")
+            LLPORT=""; [ "$ROLE" = "cpu-node-vulkan" ] && LLPORT=$(. /etc/fiehnlab/llama.env 2>/dev/null; echo "${PORT:-8080}")
             for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10; do
               ufw allow from "$net" to any port 9100 proto tcp >>"$L" 2>&1
               ufw allow from "$net" to any port 9835 proto tcp >>"$L" 2>&1
@@ -433,7 +438,7 @@ autoinstall:
           systemctl enable --now apparmor >>"$L" 2>&1 && echo "OK: apparmor" >>"$L" || echo "WARN: apparmor" >>"$L"
           systemctl enable --now unattended-upgrades >>"$L" 2>&1
           systemctl enable apt-daily.timer apt-daily-upgrade.timer >>"$L" 2>&1 && echo "OK: unattended-upgrades" >>"$L" || echo "WARN: uu-timers" >>"$L"
-          if [ "$ROLE" = "gpu-node" ] || [ "$ROLE" = "cpu-node" ]; then
+          if [ "$ROLE" = "gpu-node" ] || [ "$ROLE" = "cpu-node" ] || [ "$ROLE" = "cpu-node-vulkan" ]; then
             SVCS="avahi-daemon cups cups-browsed bluetooth ModemManager whoopsie"
           else
             SVCS="whoopsie apport"
@@ -456,6 +461,11 @@ autoinstall:
           mkdir -p /etc/fiehnlab /opt/llama-vulkan
           [ -f "$M" ] && exit 0
           echo "=== fiehnlab-vulkan-llama $(date -Is) ===" >> "$L"
+          # The image variant decides whether the Vulkan path runs at all.
+          # Pure cpu-node (@@VULKAN@@=0) never touches the GPU.
+          if [ "@@VULKAN@@" != "1" ]; then
+            echo "OK: cpu-node (pure CPU image; Vulkan inference disabled)" >> "$L"; touch "$M"; exit 0
+          fi
           V=$(cat /etc/fiehnlab/gpu 2>/dev/null)
           # No AMD GPU -> pure CPU node, nothing to accelerate.
           if ! echo "$V" | grep -qiE "\[1002:"; then
